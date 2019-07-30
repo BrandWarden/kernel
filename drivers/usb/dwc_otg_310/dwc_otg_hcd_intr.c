@@ -724,6 +724,7 @@ update_isoc_urb_state(dwc_otg_hcd_t *hcd,
 		frame_desc->status = 0;
 		frame_desc->actual_length =
 		    get_actual_xfer_length(hc, hc_regs, qtd, halt_status, NULL);
+		urb->actual_length += frame_desc->actual_length;
 
 		/* non DWORD-aligned buffer case handling. */
 		if (hc->align_buff && frame_desc->actual_length && hc->ep_is_in) {
@@ -752,6 +753,7 @@ update_isoc_urb_state(dwc_otg_hcd_t *hcd,
 		frame_desc->status = -DWC_E_PROTOCOL;
 		frame_desc->actual_length =
 		    get_actual_xfer_length(hc, hc_regs, qtd, halt_status, NULL);
+		urb->actual_length += frame_desc->actual_length;
 
 		/* non DWORD-aligned buffer case handling. */
 		if (hc->align_buff && frame_desc->actual_length && hc->ep_is_in) {
@@ -1060,16 +1062,14 @@ static int32_t handle_xfercomp_isoc_split_in(dwc_otg_hcd_t *hcd,
 {
 	uint32_t len;
 	struct dwc_otg_hcd_iso_packet_desc *frame_desc;
+	hctsiz_data_t hctsiz;
+
 	frame_desc = &qtd->urb->iso_descs[qtd->isoc_frame_index];
+	hctsiz.d32 = DWC_READ_REG32(&hc_regs->hctsiz);
 
 	len = get_actual_xfer_length(hc, hc_regs, qtd,
 				     DWC_OTG_HC_XFER_COMPLETE, NULL);
 
-	if (!len) {
-		qtd->complete_split = 0;
-		qtd->isoc_split_offset = 0;
-		return 0;
-	}
 	frame_desc->actual_length += len;
 
 	if (hc->align_buff && len)
@@ -1077,7 +1077,8 @@ static int32_t handle_xfercomp_isoc_split_in(dwc_otg_hcd_t *hcd,
 			   qtd->isoc_split_offset, hc->qh->dw_align_buf, len);
 	qtd->isoc_split_offset += len;
 
-	if (frame_desc->length == frame_desc->actual_length) {
+	if (frame_desc->length == frame_desc->actual_length ||
+	    hctsiz.b.pid == DWC_OTG_HC_PID_DATA0) {
 		frame_desc->status = 0;
 		qtd->isoc_frame_index++;
 		qtd->complete_split = 0;
@@ -1696,10 +1697,10 @@ static int32_t handle_hc_ahberr_intr(dwc_otg_hcd_t *hcd,
 	DWC_ERROR("  Max packet size: %d\n",
 		  dwc_otg_hcd_get_mps(&urb->pipe_info));
 	DWC_ERROR("  Data buffer length: %d\n", urb->length);
-	DWC_ERROR("  Transfer buffer: %p, Transfer DMA: %p\n",
-		  urb->buf, (void *)urb->dma);
-	DWC_ERROR("  Setup buffer: %p, Setup DMA: %p\n",
-		  urb->setup_packet, (void *)urb->setup_dma);
+	DWC_ERROR("  Transfer buffer: %p, Transfer DMA: %pad\n",
+		  urb->buf, &urb->dma);
+	DWC_ERROR("  Setup buffer: %p, Setup DMA: %pad\n",
+		  urb->setup_packet, &urb->setup_dma);
 	DWC_ERROR("  Interval: %d\n", urb->interval);
 
 	/* Core haltes the channel for Descriptor DMA mode */

@@ -43,6 +43,7 @@
 /dts-v1/;
 #include <dt-bindings/pwm/pwm.h>
 #include "rk3366.dtsi"
+#include "rk3366-android-6.0.dtsi"
 
 / {
 	model = "Rockchip SDK tb board";
@@ -240,6 +241,13 @@
 		regulator-name = "vcc_phy";
 		regulator-always-on;
 		regulator-boot-on;
+	};
+
+	xin32k: xin32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "xin32k";
+		#clock-cells = <0>;
 	};
 
 	io-domains {
@@ -452,7 +460,7 @@
 		compatible = "rockchip,rk818";
 		status = "okay";
 		reg = <0x1c>;
-		clock-output-names = "xin32k", "wifibt_32kin";
+		clock-output-names = "rk818-clkout1", "wifibt_32kin";
 		interrupt-parent = <&gpio0>;
 		interrupts = <2 IRQ_TYPE_LEVEL_LOW>;
 		pinctrl-names = "default";

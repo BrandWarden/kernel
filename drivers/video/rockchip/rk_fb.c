@@ -3283,6 +3283,8 @@ static int rk_fb_set_par(struct fb_info *info)
 	if (var->grayscale >> 8) {
 		xsize = (var->grayscale >> 8) & 0xfff;
 		ysize = (var->grayscale >> 20) & 0xfff;
+		xsize |= (var->reserved[0] << 12);
+		var->reserved[0] = 0;
 		if (xsize > screen->mode.xres)
 			xsize = screen->mode.xres;
 		if (ysize > screen->mode.yres)
@@ -3674,8 +3676,9 @@ int rk_fb_switch_screen(struct rk_screen *screen, int enable, int lcdc_id)
 			info = rk_fb->fb[dev_drv->fb_index_base];
 			info->var.grayscale &= 0xff;
 			info->var.grayscale |=
-				(dev_drv->cur_screen->mode.xres << 8) +
+				((dev_drv->cur_screen->mode.xres & 0xfff) << 8) +
 				(dev_drv->cur_screen->mode.yres << 20);
+			info->var.reserved[0] |= (dev_drv->cur_screen->mode.xres >> 12);
 			mutex_lock(&dev_drv->win_config);
 			info->var.xoffset = 0;
 			info->var.yoffset = 0;
@@ -3749,8 +3752,9 @@ int rk_fb_switch_screen(struct rk_screen *screen, int enable, int lcdc_id)
 			if (rk_fb->disp_mode == ONE_DUAL) {
 				info->var.grayscale &= 0xff;
 				info->var.grayscale |=
-					(dev_drv->cur_screen->xsize << 8) +
+					((dev_drv->cur_screen->mode.xres & 0xfff) << 8) +
 					(dev_drv->cur_screen->ysize << 20);
+				info->var.reserved[0] |= (dev_drv->cur_screen->mode.xres >> 12);
 			}
 			if (dev_drv->uboot_logo && win->state) {
 				if (win->area[0].xpos ||
@@ -3998,27 +4002,27 @@ static int rk_fb_alloc_buffer(struct fb_info *fbi)
 			else
 				fb_par->ion_hdl =
 				dev_drv_prmry->win[win_id_prmry]->area[0].ion_hdl;
-				fbi->screen_base =
-					ion_map_kernel(rk_fb->ion_client,
-						       fb_par->ion_hdl);
-				dev_drv->win[win_id]->area[0].ion_hdl =
-					fb_par->ion_hdl;
-				if (dev_drv->mmu_dev)
-					ret = ion_map_iommu(dev_drv->dev,
-							    rk_fb->ion_client,
-							    fb_par->ion_hdl,
-							    (unsigned long *)&phy_addr,
-							    (unsigned long *)&len);
-				else
-					ret = ion_phys(rk_fb->ion_client,
-						       fb_par->ion_hdl,
-						       &phy_addr, &len);
-				if (ret < 0) {
-					dev_err(fbi->dev, "ion map to get phy addr failed\n");
-					return -ENOMEM;
-				}
-				fbi->fix.smem_start = phy_addr;
-				fbi->fix.smem_len = len;
+			fbi->screen_base =
+				ion_map_kernel(rk_fb->ion_client,
+					       fb_par->ion_hdl);
+			dev_drv->win[win_id]->area[0].ion_hdl =
+				fb_par->ion_hdl;
+			if (dev_drv->mmu_dev)
+				ret = ion_map_iommu(dev_drv->dev,
+						    rk_fb->ion_client,
+						    fb_par->ion_hdl,
+						    (unsigned long *)&phy_addr,
+						    (unsigned long *)&len);
+			else
+				ret = ion_phys(rk_fb->ion_client,
+					       fb_par->ion_hdl,
+					       &phy_addr, &len);
+			if (ret < 0) {
+				dev_err(fbi->dev, "ion map to get phy addr failed\n");
+				return -ENOMEM;
+			}
+			fbi->fix.smem_start = phy_addr;
+			fbi->fix.smem_len = len;
 #else
 			fb_mem_virt = dma_alloc_writecombine(fbi->dev,
 							     fb_mem_size,
@@ -4281,7 +4285,8 @@ int rk_fb_register(struct rk_lcdc_driver *dev_drv,
 		fbi->var.width = dev_drv->cur_screen->width;
 		fbi->var.height = dev_drv->cur_screen->height;
 		fbi->var.grayscale |=
-		    (fbi->var.xres << 8) + (fbi->var.yres << 20);
+		    ((fbi->var.xres & 0xfff) << 8) + (fbi->var.yres << 20);
+		fbi->var.reserved[0] |= (fbi->var.xres >> 12);
 #if defined(CONFIG_LOGO_LINUX_BMP)
 		fbi->var.bits_per_pixel = 32;
 #else

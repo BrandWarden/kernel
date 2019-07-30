@@ -132,6 +132,22 @@ module_param_named(dbg_level, dbg_enable, int, 0644);
 /* fcc */
 #define MIN_FCC				500
 
+/* TS detect battery temperature */
+#define ADC_CUR_MSK			0x03
+#define ADC_CUR_20UA			0x00
+#define ADC_CUR_40UA			0x01
+#define ADC_CUR_60UA			0x02
+#define ADC_CUR_80UA			0x03
+
+#define NTC_CALC_FACTOR_80UA		7
+#define NTC_CALC_FACTOR_60UA		9
+#define NTC_CALC_FACTOR_40UA		13
+#define NTC_CALC_FACTOR_20UA		27
+#define NTC_80UA_MAX_MEASURE		27500
+#define NTC_60UA_MAX_MEASURE		36666
+#define NTC_40UA_MAX_MEASURE		55000
+#define NTC_20UA_MAX_MEASURE		110000
+
 static const char *bat_status[] = {
 	"charge off", "dead charge", "trickle charge", "cc cv",
 	"finish", "usb over vol", "bat temp error", "timer error",
@@ -143,6 +159,8 @@ struct rk818_battery {
 	struct regmap			*regmap;
 	struct device			*dev;
 	struct power_supply		*bat;
+	struct power_supply		*usb_psy;
+	struct power_supply		*ac_psy;
 	struct battery_platform_data	*pdata;
 	struct workqueue_struct		*bat_monitor_wq;
 	struct delayed_work		bat_delay_work;
@@ -150,12 +168,14 @@ struct rk818_battery {
 	struct wake_lock		wake_lock;
 	struct notifier_block           fb_nb;
 	struct timer_list		caltimer;
-	struct timeval			rtc_base;
+	time_t				rtc_base;
 	int				bat_res;
 	int				chrg_status;
 	bool				is_initialized;
 	bool				is_first_power_on;
 	u8				res_div;
+	int				current_max;
+	int				voltage_max;
 	int				current_avg;
 	int				voltage_avg;
 	int				voltage_ocv;
@@ -230,6 +250,10 @@ struct rk818_battery {
 	int				dbg_meet_soc;
 	int				dbg_calc_dsoc;
 	int				dbg_calc_rsoc;
+	u8				ac_in;
+	u8				usb_in;
+	int				is_charging;
+	unsigned long			charge_count;
 };
 
 #define DIV(x)	((x) ? (x) : 1)
@@ -857,7 +881,77 @@ static enum power_supply_property rk818_bat_props[] = {
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
 };
+
+static int rk818_bat_get_usb_psy(struct device *dev, void *data)
+{
+	struct rk818_battery *di = data;
+	struct power_supply *psy = dev_get_drvdata(dev);
+
+	if (psy->desc->type == POWER_SUPPLY_TYPE_USB) {
+		di->usb_psy = psy;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int rk818_bat_get_ac_psy(struct device *dev, void *data)
+{
+	struct rk818_battery *di = data;
+	struct power_supply *psy = dev_get_drvdata(dev);
+
+	if (psy->desc->type == POWER_SUPPLY_TYPE_MAINS) {
+		di->ac_psy = psy;
+		return 1;
+	}
+
+	return 0;
+}
+
+static void rk818_bat_get_chrg_psy(struct rk818_battery *di)
+{
+	if (!di->usb_psy)
+		class_for_each_device(power_supply_class, NULL, (void *)di,
+				      rk818_bat_get_usb_psy);
+	if (!di->ac_psy)
+		class_for_each_device(power_supply_class, NULL, (void *)di,
+				      rk818_bat_get_ac_psy);
+}
+
+static int rk818_bat_get_charge_state(struct rk818_battery *di)
+{
+	union power_supply_propval val;
+	int ret;
+
+	if (!di->usb_psy || !di->ac_psy)
+		rk818_bat_get_chrg_psy(di);
+
+	if (di->usb_psy) {
+		ret = di->usb_psy->desc->get_property(di->usb_psy,
+						      POWER_SUPPLY_PROP_ONLINE,
+						      &val);
+		if (!ret)
+			di->usb_in = val.intval;
+	}
+
+	if (di->ac_psy) {
+		ret = di->ac_psy->desc->get_property(di->ac_psy,
+						     POWER_SUPPLY_PROP_ONLINE,
+						     &val);
+		if (!ret)
+			di->ac_in = val.intval;
+	}
+
+	DBG("%s: ac_online=%d, usb_online=%d\n",
+	    __func__, di->ac_in, di->usb_in);
+
+	return (di->usb_in || di->ac_in);
+}
 
 static int rk818_battery_get_property(struct power_supply *psy,
 				      enum power_supply_property psp,
@@ -900,10 +994,22 @@ static int rk818_battery_get_property(struct power_supply *psy,
 			val->intval = VIRTUAL_STATUS;
 		else if (di->dsoc == 100)
 			val->intval = POWER_SUPPLY_STATUS_FULL;
-		else if (rk818_bat_chrg_online(di))
+		else if (rk818_bat_get_charge_state(di))
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		else
 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+		val->intval = di->charge_count;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		val->intval = di->pdata->design_capacity * 1000;/* uAh */
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		val->intval = di->voltage_max;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		val->intval = di->current_max;
 		break;
 	default:
 		return -EINVAL;
@@ -1130,7 +1236,10 @@ static void rk818_bat_not_first_pwron(struct rk818_battery *di)
 	di->is_initialized = is_rk818_bat_initialized(di);
 	di->is_ocv_calib = is_rk818_bat_ocv_valid(di);
 
-	if (di->is_halt) {
+	if (di->is_initialized) {
+		BAT_INFO("initialized yet..\n");
+		goto finish;
+	} else if (di->is_halt) {
 		BAT_INFO("system halt last time... cap: pre=%d, now=%d\n",
 			 pre_cap, now_cap);
 		if (now_cap < 0)
@@ -1138,9 +1247,6 @@ static void rk818_bat_not_first_pwron(struct rk818_battery *di)
 		rk818_bat_init_coulomb_cap(di, now_cap);
 		pre_cap = now_cap;
 		pre_soc = di->rsoc;
-		goto finish;
-	} else if (di->is_initialized) {
-		BAT_INFO("initialized yet..\n");
 		goto finish;
 	} else if (di->is_ocv_calib) {
 		ocv_vol = rk818_bat_get_ocv_voltage(di);
@@ -1832,8 +1938,8 @@ static void rk818_bat_debug_info(struct rk818_battery *di)
 	DBG("###############################################################\n"
 	    "Dsoc=%d, Rsoc=%d, Vavg=%d, Iavg=%d, Cap=%d, Fcc=%d, d=%d\n"
 	    "K=%d, Mode=%s, Oldcap=%d, Is=%d, Ip=%d, Vs=%d\n"
-	    "fb_temp=%d, bat_temp=%d, sample_res=%d\n"
-	    "off:i=0x%x, c=0x%x, p=%d, Rbat=%d, age_ocv_cap=%d, fb=%d\n"
+	    "fb_temp=%d, bat_temp=%d, sample_res=%d, USB=%d, DC=%d\n"
+	    "off:i=0x%x, c=0x%x, p=%d, Rbat=%d, age_ocv_cap=%d, fb=%d, hot=%d\n"
 	    "adp:finish=%lu, boot_min=%lu, sleep_min=%lu, adc=%d, Vsys=%d\n"
 	    "bat:%s, meet: soc=%d, calc: dsoc=%d, rsoc=%d, Vocv=%d\n"
 	    "pwr: dsoc=%d, rsoc=%d, vol=%d, halt: st=%d, cnt=%d, reboot=%d\n"
@@ -1847,9 +1953,11 @@ static void rk818_bat_debug_info(struct rk818_battery *di)
 	    chrg_cur_input_array[usb_ctrl & 0x0f],
 	    chrg_vol_sel_array[(chrg_ctrl1 & 0x70) >> 4],
 	    feedback_temp_array[(thermal & 0x0c) >> 2], di->temperature,
-	    di->pdata->sample_res, rk818_bat_get_ioffset(di),
+	    di->pdata->sample_res, di->usb_in, di->ac_in,
+	    rk818_bat_get_ioffset(di),
 	    rk818_bat_get_coffset(di), di->poffset, di->bat_res,
-	    di->age_adjust_cap, di->fb_blank, base2min(di->finish_base),
+	    di->age_adjust_cap, di->fb_blank, !!(thermal & HOTDIE_STS),
+	    base2min(di->finish_base),
 	    base2min(di->boot_base), di->sleep_sum_sec / 60,
 	    di->adc_allow_update,
 	    di->voltage_avg + di->current_avg * DEF_PWRPATH_RES / 1000,
@@ -2074,7 +2182,8 @@ static void rk818_bat_smooth_algorithm(struct rk818_battery *di)
 	di->remain_cap = rk818_bat_get_coulomb_cap(di);
 
 	/* full charge: slow down */
-	if ((di->dsoc == 99) && (di->chrg_status == CC_OR_CV)) {
+	if ((di->dsoc == 99) && (di->chrg_status == CC_OR_CV) &&
+	    (di->current_avg > 0)) {
 		di->sm_linek = FULL_CHRG_K;
 	/* terminal charge, slow down */
 	} else if ((di->current_avg >= TERM_CHRG_CURR) &&
@@ -2381,7 +2490,7 @@ static int rk818_bat_sleep_dischrg(struct rk818_battery *di)
 
 static void rk818_bat_power_supply_changed(struct rk818_battery *di)
 {
-	u8 status;
+	u8 status, thermal;
 	static int old_soc = -1;
 
 	if (di->dsoc > 100)
@@ -2392,15 +2501,17 @@ static void rk818_bat_power_supply_changed(struct rk818_battery *di)
 	if (di->dsoc == old_soc)
 		return;
 
+	thermal = rk818_bat_read(di, RK818_THERMAL_REG);
 	status = rk818_bat_read(di, RK818_SUP_STS_REG);
 	status = (status & CHRG_STATUS_MSK) >> 4;
 	old_soc = di->dsoc;
 	di->last_dsoc = di->dsoc;
 	power_supply_changed(di->bat);
 	BAT_INFO("changed: dsoc=%d, rsoc=%d, v=%d, ov=%d c=%d, "
-		 "cap=%d, f=%d, st=%s\n",
+		 "cap=%d, f=%d, st=%s, hotdie=%d\n",
 		 di->dsoc, di->rsoc, di->voltage_avg, di->voltage_ocv,
-		 di->current_avg, di->remain_cap, di->fcc, bat_status[status]);
+		 di->current_avg, di->remain_cap, di->fcc, bat_status[status],
+		 !!(thermal & HOTDIE_STS));
 
 	BAT_INFO("dl=%d, rl=%d, v=%d, halt=%d, halt_n=%d, max=%d, "
 		 "init=%d, sw=%d, calib=%d, below0=%d, force=%d\n",
@@ -2464,12 +2575,24 @@ static void rk818_bat_rsoc_daemon(struct rk818_battery *di)
 
 static void rk818_bat_update_info(struct rk818_battery *di)
 {
+	int is_charging;
+
 	di->voltage_avg = rk818_bat_get_avg_voltage(di);
 	di->current_avg = rk818_bat_get_avg_current(di);
 	di->voltage_relax = rk818_bat_get_relax_voltage(di);
 	di->rsoc = rk818_bat_get_rsoc(di);
 	di->remain_cap = rk818_bat_get_coulomb_cap(di);
 	di->chrg_status = rk818_bat_get_chrg_status(di);
+	is_charging = rk818_bat_get_charge_state(di);
+	if (is_charging != di->is_charging) {
+		di->is_charging = is_charging;
+		if (is_charging)
+			di->charge_count++;
+	}
+	if (di->voltage_avg > di->voltage_max)
+		di->voltage_max = di->voltage_avg;
+	if (di->current_avg > di->current_max)
+		di->current_max = di->current_avg;
 
 	/* smooth charge */
 	if (di->remain_cap > di->fcc) {
@@ -2497,24 +2620,147 @@ static void rk818_bat_update_info(struct rk818_battery *di)
 	}
 }
 
-/* get ntc resistance */
+static void rk818_bat_init_ts1_detect(struct rk818_battery *di)
+{
+	u8 buf;
+	u32 *ntc_table = di->pdata->ntc_table;
+
+	if (!di->pdata->ntc_size)
+		return;
+
+	/* select ua */
+	buf = rk818_bat_read(di, RK818_TS_CTRL_REG);
+	buf &= ~TS1_CUR_MSK;
+	/* chose suitable UA for temperature detect */
+	if (ntc_table[0] < NTC_80UA_MAX_MEASURE) {
+		di->pdata->ntc_factor = NTC_CALC_FACTOR_80UA;
+		di->pdata->ntc_uA = 80;
+		buf |= ADC_CUR_80UA;
+	} else if (ntc_table[0] < NTC_60UA_MAX_MEASURE) {
+		di->pdata->ntc_factor = NTC_CALC_FACTOR_60UA;
+		di->pdata->ntc_uA = 60;
+		buf |= ADC_CUR_60UA;
+	} else if (ntc_table[0] < NTC_40UA_MAX_MEASURE) {
+		di->pdata->ntc_factor = NTC_CALC_FACTOR_40UA;
+		di->pdata->ntc_uA = 40;
+		buf |= ADC_CUR_40UA;
+	} else {
+		di->pdata->ntc_factor = NTC_CALC_FACTOR_20UA;
+		di->pdata->ntc_uA = 20;
+		buf |= ADC_CUR_20UA;
+	}
+	rk818_bat_write(di, RK818_TS_CTRL_REG, buf);
+
+	/* enable ADC_TS1_EN */
+	buf = rk818_bat_read(di, RK818_ADC_CTRL_REG);
+	buf |= ADC_TS1_EN;
+	rk818_bat_write(di, RK818_ADC_CTRL_REG, buf);
+}
+
+/*
+ * Due to hardware design issue, Vdelta = "(R_sample + R_other) * I_avg" will be
+ * included into TS1 adc value. We must subtract it to get correct adc value.
+ * The solution:
+ *
+ * (1) calculate Vdelta:
+ *
+ *   adc1 - Vdelta    ua1			  (adc2 * ua1) - (adc1 * ua2)
+ *   ------------- = -----  ==> equals: Vdelta = -----------------------------
+ *   adc2 - Vdelta    ua2				ua1 - ua2
+ *
+ *
+ * (2) calculate correct ADC value:
+ *
+ *     charging: ADC = adc1 - abs(Vdelta);
+ *  discharging: ADC = adc1 + abs(Vdelta);
+ */
 static int rk818_bat_get_ntc_res(struct rk818_battery *di)
 {
-	int val = 0;
+	int adc1 = 0, adc2 = 0;
+	int ua1, ua2, v_delta, res, val;
+	u8 buf;
 
-	val |= rk818_bat_read(di, RK818_TS1_ADC_REGL) << 0;
-	val |= rk818_bat_read(di, RK818_TS1_ADC_REGH) << 8;
+	/* read sample ua1 */
+	buf = rk818_bat_read(di, RK818_TS_CTRL_REG);
+	DBG("<%s>. read adc1, sample uA=%d\n",
+	    __func__, ((buf & 0x03) + 1) * 20);
 
-	val = val * NTC_CALC_FACTOR; /*reference voltage 2.2V,current 80ua*/
-	DBG("<%s>. ntc_res=%d\n", __func__, val);
+	/* read adc adc1 */
+	ua1 = di->pdata->ntc_uA;
+	adc1 |= rk818_bat_read(di, RK818_TS1_ADC_REGL) << 0;
+	adc1 |= rk818_bat_read(di, RK818_TS1_ADC_REGH) << 8;
 
-	return val;
+	/* chose reference UA for adc2 */
+	ua2 = (ua1 != 20) ? 20 : 40;
+	buf = rk818_bat_read(di, RK818_TS_CTRL_REG);
+	buf &= ~TS1_CUR_MSK;
+	buf |= ((ua2 - 20) / 20);
+	rk818_bat_write(di, RK818_TS_CTRL_REG, buf);
+
+	/* read adc adc2 */
+	msleep(1000);
+
+	/* read sample ua2 */
+	buf = rk818_bat_read(di, RK818_TS_CTRL_REG);
+	DBG("<%s>. read adc2, sample uA=%d\n",
+	    __func__, ((buf & 0x03) + 1) * 20);
+
+	adc2 |= rk818_bat_read(di, RK818_TS1_ADC_REGL) << 0;
+	adc2 |= rk818_bat_read(di, RK818_TS1_ADC_REGH) << 8;
+
+	DBG("<%s>. ua1=%d, ua2=%d, adc1=%d, adc2=%d\n",
+	    __func__, ua1, ua2, adc1, adc2);
+
+	/* calculate delta voltage */
+	if (adc2 != adc1)
+		v_delta = abs((adc2 * ua1 - adc1 * ua2) / (ua2 - ua1));
+	else
+		v_delta = 0;
+
+	/* considering current avg direction, calcuate real adc value */
+	val = (di->current_avg >= 0) ? (adc1 - v_delta) : (adc1 + v_delta);
+
+	DBG("<%s>. Iavg=%d, Vdelta=%d, Vadc=%d\n",
+	    __func__, di->current_avg, v_delta, val);
+
+	res = val * di->pdata->ntc_factor;
+
+	DBG("<%s>. val=%d, ntc_res=%d, ntc_factor=%d, Rdelta=%d\n",
+	    __func__, val, res, di->pdata->ntc_factor,
+	    v_delta * di->pdata->ntc_factor);
+
+	DBG("<%s>. t=[%d'C(%d) ~ %dC(%d)]\n", __func__,
+	    di->pdata->ntc_degree_from, di->pdata->ntc_table[0],
+	    di->pdata->ntc_degree_from + di->pdata->ntc_size - 1,
+	    di->pdata->ntc_table[di->pdata->ntc_size - 1]);
+
+	rk818_bat_init_ts1_detect(di);
+
+	return res;
+}
+
+static BLOCKING_NOTIFIER_HEAD(rk818_bat_notifier_chain);
+
+int rk818_bat_temp_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&rk818_bat_notifier_chain, nb);
+}
+
+int rk818_bat_temp_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&rk818_bat_notifier_chain, nb);
+}
+
+static void rk818_bat_temp_notifier_callback(int temp)
+{
+	blocking_notifier_call_chain(&rk818_bat_notifier_chain, temp, NULL);
 }
 
 static void rk818_bat_update_temperature(struct rk818_battery *di)
 {
+	static int old_temp, first_time = 1;
 	u32 ntc_size, *ntc_table;
-	int i, res;
+	int i, res, temp;
 
 	ntc_table = di->pdata->ntc_table;
 	ntc_size = di->pdata->ntc_size;
@@ -2523,15 +2769,39 @@ static void rk818_bat_update_temperature(struct rk818_battery *di)
 	if (ntc_size) {
 		res = rk818_bat_get_ntc_res(di);
 		if (res < ntc_table[ntc_size - 1]) {
+			di->temperature = di->pdata->ntc_degree_from +
+					  di->pdata->ntc_size - 1;
 			BAT_INFO("bat ntc upper max degree: R=%d\n", res);
 		} else if (res > ntc_table[0]) {
+			di->temperature = di->pdata->ntc_degree_from;
 			BAT_INFO("bat ntc lower min degree: R=%d\n", res);
 		} else {
 			for (i = 0; i < ntc_size; i++) {
 				if (res >= ntc_table[i])
 					break;
 			}
-			di->temperature = (i + di->pdata->ntc_degree_from) * 10;
+
+			/* if first in, init old_temp */
+			temp = (i + di->pdata->ntc_degree_from) * 10;
+			if (first_time == 1) {
+				di->temperature = temp;
+				old_temp = temp;
+				first_time = 0;
+			}
+
+			/*
+			 * compare with old one, it's invalid when over 50
+			 * and we should use old data.
+			 */
+			if (abs(temp - old_temp) > 50)
+				temp = old_temp;
+			else
+				old_temp = temp;
+
+			di->temperature = temp;
+			DBG("<%s>. temperature = %d\n",
+			    __func__, di->temperature);
+			rk818_bat_temp_notifier_callback(di->temperature / 10);
 		}
 	}
 }
@@ -2769,7 +3039,8 @@ static int rk818_bat_init_irqs(struct rk818_battery *di)
 	}
 
 	ret = devm_request_threaded_irq(di->dev, vb_lo_irq, NULL,
-					rk818_vb_low_irq, IRQF_TRIGGER_HIGH,
+					rk818_vb_low_irq,
+					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
 					"rk818_vb_low", di);
 	if (ret) {
 		dev_err(&pdev->dev, "vb_lo_irq request failed!\n");
@@ -2791,43 +3062,39 @@ static void rk818_bat_init_info(struct rk818_battery *di)
 		       SAMPLE_RES_DIV1 : SAMPLE_RES_DIV2;
 }
 
-static int rk818_bat_rtc_sleep_sec(struct rk818_battery *di)
+static time_t rk818_get_rtc_sec(void)
 {
 	int err;
-	int interval_sec = 0;
 	struct rtc_time tm;
 	struct timespec tv = { .tv_nsec = NSEC_PER_SEC >> 1, };
 	struct rtc_device *rtc = rtc_class_open(CONFIG_RTC_HCTOSYS_DEVICE);
+	time_t sec;
 
 	err = rtc_read_time(rtc, &tm);
 	if (err) {
-		dev_err(rtc->dev.parent, "hctosys: read hardware clk failed\n");
+		dev_err(rtc->dev.parent, "read hardware clk failed\n");
 		return 0;
 	}
 
 	err = rtc_valid_tm(&tm);
 	if (err) {
-		dev_err(rtc->dev.parent, "hctosys: invalid date time\n");
+		dev_err(rtc->dev.parent, "invalid date time\n");
 		return 0;
 	}
 
 	rtc_tm_to_time(&tm, &tv.tv_sec);
-	interval_sec = tv.tv_sec - di->rtc_base.tv_sec;
+	sec = tv.tv_sec;
 
-	return (interval_sec > 0) ? interval_sec : 0;
+	return sec;
 }
 
-static void rk818_bat_init_ts1_detect(struct rk818_battery *di)
+static int rk818_bat_rtc_sleep_sec(struct rk818_battery *di)
 {
-	u8 buf;
+	int interval_sec;
 
-	if (!di->pdata->ntc_size)
-		return;
+	interval_sec = rk818_get_rtc_sec() - di->rtc_base;
 
-	/* ADC_TS1_EN */
-	buf = rk818_bat_read(di, RK818_ADC_CTRL_REG);
-	buf |= ADC_TS1_EN;
-	rk818_bat_write(di, RK818_ADC_CTRL_REG, buf);
+	return (interval_sec > 0) ? interval_sec : 0;
 }
 
 static void rk818_bat_set_shtd_vol(struct rk818_battery *di)
@@ -3151,7 +3418,7 @@ static int rk818_battery_suspend(struct platform_device *dev,
 	di->current_avg = rk818_bat_get_avg_current(di);
 	di->remain_cap = rk818_bat_get_coulomb_cap(di);
 	di->rsoc = rk818_bat_get_rsoc(di);
-	do_gettimeofday(&di->rtc_base);
+	di->rtc_base = rk818_get_rtc_sec();
 	rk818_bat_save_data(di);
 	st = (rk818_bat_read(di, RK818_SUP_STS_REG) & CHRG_STATUS_MSK) >> 4;
 

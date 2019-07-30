@@ -103,6 +103,13 @@
 		regulator-boot-on;
 	};
 
+	xin32k: xin32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "xin32k";
+		#clock-cells = <0>;
+	};
+
 	spdif-sound {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "rockchip,spdif";
@@ -374,7 +381,7 @@
 		compatible = "rockchip,rk818";
 		status = "okay";
 		reg = <0x1c>;
-		clock-output-names = "xin32k", "wifibt_32kin";
+		clock-output-names = "rk818-clkout1", "wifibt_32kin";
 		interrupt-parent = <&gpio1>;
 		interrupts = <21 IRQ_TYPE_LEVEL_LOW>;
 		pinctrl-names = "default";
@@ -624,13 +631,13 @@
 };
 
 &soc_crit {
-	temperature = <100000>; /* millicelsius */
+	temperature = <115000>; /* millicelsius */
 };
 
 &tsadc {
 	rockchip,hw-tshut-mode = <1>; /* tshut mode 0:CRU 1:GPIO */
 	rockchip,hw-tshut-polarity = <1>; /* tshut polarity 0:LOW 1:HIGH */
-	rockchip,hw-tshut-temp = <110000>;
+	rockchip,hw-tshut-temp = <120000>;
 	status = "okay";
 };
 
@@ -839,22 +846,22 @@
  * and cpu(cluster1_opp) frequence.
  */
 &gpu_opp_table {
-	opp@200000000 {
+	opp-200000000 {
 		status = "disabled";
 	};
-	opp@297000000 {
+	opp-297000000 {
 		status = "disabled";
 	};
 };
 
 &cluster1_opp {
-	opp@408000000 {
+	opp-408000000 {
 		status = "disabled";
 	};
-	opp@600000000 {
+	opp-600000000 {
 		status = "disabled";
 	};
-	opp@816000000 {
+	opp-816000000 {
 		status = "disabled";
 	};
 };

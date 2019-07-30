@@ -53,9 +53,6 @@ int dev_pm_opp_add(struct device *dev, unsigned long freq,
 		   unsigned long u_volt);
 void dev_pm_opp_remove(struct device *dev, unsigned long freq);
 
-int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
-			      unsigned long u_volt);
-
 int dev_pm_opp_enable(struct device *dev, unsigned long freq);
 
 int dev_pm_opp_disable(struct device *dev, unsigned long freq);
@@ -69,7 +66,7 @@ void dev_pm_opp_put_prop_name(struct device *dev);
 int dev_pm_opp_set_regulator(struct device *dev, const char *name);
 void dev_pm_opp_put_regulator(struct device *dev);
 int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq);
-int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq);
+int dev_pm_opp_check_rate_volt(struct device *dev, bool force);
 #else
 static inline unsigned long dev_pm_opp_get_voltage(struct dev_pm_opp *opp)
 {
@@ -139,13 +136,6 @@ static inline void dev_pm_opp_remove(struct device *dev, unsigned long freq)
 {
 }
 
-static inline int
-dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
-			  unsigned long u_volt)
-{
-	return 0;
-}
-
 static inline int dev_pm_opp_enable(struct device *dev, unsigned long freq)
 {
 	return 0;
@@ -190,8 +180,7 @@ static inline int dev_pm_opp_set_rate(struct device *dev, unsigned long target_f
 	return -EINVAL;
 }
 
-static inline int dev_pm_opp_check_initial_rate(struct device *dev,
-						unsigned long *cur_freq)
+static inline int dev_pm_opp_check_rate_volt(struct device *dev, bool force)
 {
 	return -EINVAL;
 }

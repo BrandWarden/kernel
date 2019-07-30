@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifdef CONFIG_ARM64
 #include "usbdev_rk.h"
 #include "dwc_otg_regs.h"
@@ -37,7 +38,7 @@ static void usb20otg_phy_suspend(void *pdata, int suspend)
 	struct dwc_otg_platform_data *usbpdata = pdata;
 	if (suspend) {
 		/* enable soft control */
-		uoc_write(UOC_HIWORD_UPDATE(0x1d5, 0x1ff, 0), 0x700);
+		uoc_write(UOC_HIWORD_UPDATE(0x1d1, 0x1ff, 0), 0x700);
 		usbpdata->phy_status = 1;
 	} else {
 		/* exit suspend */
@@ -240,7 +241,7 @@ static void usb20ehci_phy_suspend(void *pdata, int suspend)
 
 	if (suspend) {
 		/* enable soft control */
-		uoc_write(UOC_HIWORD_UPDATE(0x1d5, 0x1ff, 0), 0x728);
+		uoc_write(UOC_HIWORD_UPDATE(0x1d1, 0x1ff, 0), 0x728);
 		usbpdata->phy_status = 1;
 	} else {
 		/* exit suspend */

@@ -44,7 +44,7 @@ struct tee_shm *tee_shm_alloc_from_rpc(struct tee *tee, size_t size)
 	INMSG();
 
 	mutex_lock(&tee->lock);
-	shm = tee_shm_alloc(tee, size, TEE_SHM_TEMP | TEE_SHM_FROM_RPC);
+	shm = rk_tee_shm_alloc(tee, size, TEE_SHM_TEMP | TEE_SHM_FROM_RPC);
 	if (IS_ERR_OR_NULL(shm)) {
 		dev_err(_DEV(tee), "%s: buffer allocation failed (%ld)\n",
 			__func__, PTR_ERR(shm));
@@ -75,11 +75,11 @@ void tee_shm_free_from_rpc(struct tee_shm *shm)
 		list_del(&shm->entry);
 	}
 
-	tee_shm_free(shm);
+	rk_tee_shm_free(shm);
 	mutex_unlock(&tee->lock);
 }
 
-struct tee_shm *tee_shm_alloc(struct tee *tee, size_t size, uint32_t flags)
+struct tee_shm *rk_tee_shm_alloc(struct tee *tee, size_t size, uint32_t flags)
 {
 	struct tee_shm *shm;
 	unsigned long pfn;
@@ -99,8 +99,8 @@ struct tee_shm *tee_shm_alloc(struct tee *tee, size_t size, uint32_t flags)
 
 	shm->tee = tee;
 
-	dev_dbg(_DEV(tee), "%s: shm=%p, paddr=%p,s=%d/%d app=\"%s\" pid=%d\n",
-		 __func__, shm, (void *)shm->paddr, (int)shm->size_req,
+	dev_dbg(_DEV(tee), "%s: shm=%p, paddr=%pad,s=%d/%d app=\"%s\" pid=%d\n",
+		 __func__, shm, &shm->paddr, (int)shm->size_req,
 		 (int)shm->size_alloc, current->comm, current->pid);
 
 	pfn = shm->paddr >> PAGE_SHIFT;
@@ -128,7 +128,7 @@ exit:
 	return shm;
 }
 
-void tee_shm_free(struct tee_shm *shm)
+void rk_tee_shm_free(struct tee_shm *shm)
 {
 	struct tee *tee;
 
@@ -276,8 +276,8 @@ static void _tee_shm_dma_buf_release(struct dma_buf *dmabuf)
 	INMSG();
 
 	ctx = shm->ctx;
-	dev_dbg(_DEV(ctx->tee), "%s: shm=%p, paddr=%p,s=%d/%d app=\"%s\" pid=%d\n",
-		 __func__, shm, (void *)shm->paddr, (int)shm->size_req,
+	dev_dbg(_DEV(ctx->tee), "%s: shm=%p, paddr=%pad,s=%d/%d app=\"%s\" pid=%d\n",
+		 __func__, shm, &shm->paddr, (int)shm->size_req,
 		 (int)shm->size_alloc, current->comm, current->pid);
 
 	tee_shm_free_io(shm);
@@ -311,8 +311,8 @@ static int _tee_shm_dma_buf_mmap(struct dma_buf *dmabuf,
 	if (!ret)
 		vma->vm_private_data = (void *)shm;
 
-	dev_dbg(_DEV(shm->ctx->tee), "%s: map the shm (p@=%p,s=%dKiB) => %x\n",
-		__func__, (void *)shm->paddr, (int)size / 1024,
+	dev_dbg(_DEV(shm->ctx->tee), "%s: map the shm (p@=%pad,s=%dKiB) => %x\n",
+		__func__, &shm->paddr, (int)size / 1024,
 		(unsigned int)vma->vm_start);
 
 	OUTMSG(ret);
@@ -329,8 +329,8 @@ static void *_tee_shm_dma_buf_kmap(struct dma_buf *db, unsigned long pgnum)
 {
 	struct tee_shm *shm = db->priv;
 
-	dev_dbg(_DEV(shm->ctx->tee), "%s: kmap the shm (p@=%p, v@=%p, s=%zdKiB)\n",
-		__func__, (void *)shm->paddr, (void *)shm->kaddr,
+	dev_dbg(_DEV(shm->ctx->tee), "%s: kmap the shm (p@=%pad, v@=%p, s=%zdKiB)\n",
+		__func__, &shm->paddr, (void *)shm->kaddr,
 		shm->size_alloc / 1024);
 	/*
 	 * A this stage, a shm allocated by the tee
@@ -402,7 +402,7 @@ int tee_shm_alloc_io(struct tee_context *ctx, struct tee_shm_io *shm_io)
 		shm_io->fd_shm = 0;
 
 	mutex_lock(&tee->lock);
-	shm = tee_shm_alloc(tee, shm_io->size, shm_io->flags);
+	shm = rk_tee_shm_alloc(tee, shm_io->size, shm_io->flags);
 	if (IS_ERR_OR_NULL(shm)) {
 		dev_err(_DEV(tee), "%s: buffer allocation failed (%ld)\n",
 			__func__, PTR_ERR(shm));
@@ -413,7 +413,7 @@ int tee_shm_alloc_io(struct tee_context *ctx, struct tee_shm_io *shm_io)
 	if (ctx->usr_client) {
 		ret = export_buf(tee, shm, &shm_io->fd_shm);
 		if (ret) {
-			tee_shm_free(shm);
+			rk_tee_shm_free(shm);
 			ret = -ENOMEM;
 			goto out;
 		}
@@ -445,7 +445,7 @@ void tee_shm_free_io(struct tee_shm *shm)
 	tee_dec_stats(&tee->stats[TEE_STATS_SHM_IDX]);
 	list_del(&shm->entry);
 
-	tee_shm_free(shm);
+	rk_tee_shm_free(shm);
 	tee_put(ctx->tee);
 	tee_context_put(ctx);
 	if (dev)
@@ -470,7 +470,7 @@ int tee_shm_fd_for_rpc(struct tee_context *ctx, struct tee_shm_io *shm_io)
 	if (!list_empty(&tee->list_rpc_shm)) {
 		list_for_each(pshm, &tee->list_rpc_shm) {
 			shm = list_entry(pshm, struct tee_shm, entry);
-			if ((void *)shm->paddr == shm_io->buffer)
+			if ((void *)(unsigned long)shm->paddr == shm_io->buffer)
 				goto found;
 		}
 	}
@@ -558,8 +558,8 @@ static int tee_shm_db_get(struct tee *tee, struct tee_shm *shm, int fd,
 
 	shm->flags |= TEEC_MEM_DMABUF;
 
-	dev_dbg(_DEV(tee), "fd=%d @p=%p is_tee=%d db=%p\n", fd,
-			(void *)shm->paddr, sdb->tee_allocated, dma_buf);
+	dev_dbg(_DEV(tee), "fd=%d @p=%pad is_tee=%d db=%p\n", fd,
+			&shm->paddr, sdb->tee_allocated, dma_buf);
 	goto exit;
 
 buf_unmap:
@@ -755,8 +755,8 @@ struct tee_shm *tee_shm_get(struct tee_context *ctx, TEEC_SharedMemory *c_shm,
 			goto err;
 		}
 
-		dev_dbg(_DEV(tee), "fd=%d @p=%p\n",
-				c_shm->d.fd, (void *)shm->paddr);
+		dev_dbg(_DEV(tee), "fd=%d @p=%pad\n",
+				c_shm->d.fd, &shm->paddr);
 	} else if (c_shm->d.fd) {
 		ret = tee_shm_db_get(tee, shm,
 				c_shm->d.fd, c_shm->flags, size, offset);
@@ -787,12 +787,12 @@ err:
 	return ERR_PTR(ret);
 }
 
-void tee_shm_put(struct tee_context *ctx, struct tee_shm *shm)
+void rk_tee_shm_put(struct tee_context *ctx, struct tee_shm *shm)
 {
 	struct tee *tee = ctx->tee;
 
-	dev_dbg(_DEV(tee), "%s: > shm=%p flags=%08x paddr=%p\n",
-			__func__, (void *)shm, shm->flags, (void *)shm->paddr);
+	dev_dbg(_DEV(tee), "%s: > shm=%p flags=%08x paddr=%pad\n",
+			__func__, (void *)shm, shm->flags, &shm->paddr);
 
 	BUG_ON(!shm);
 	BUG_ON(!(shm->flags & TEE_SHM_MEMREF));

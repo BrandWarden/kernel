@@ -330,7 +330,7 @@ static int drm_minor_register(struct drm_device *dev, unsigned int type)
 	ret = drm_debugfs_init(minor, minor->index, drm_debugfs_root);
 	if (ret) {
 		DRM_ERROR("DRM: Failed to initialize /sys/kernel/debug/dri.\n");
-		return ret;
+		goto err_debugfs;
 	}
 
 	ret = device_add(minor->kdev);
@@ -415,6 +415,28 @@ struct drm_minor *drm_minor_acquire(unsigned int minor_id)
 void drm_minor_release(struct drm_minor *minor)
 {
 	drm_dev_unref(minor->dev);
+}
+
+struct drm_device *drm_device_get_by_name(const char *name)
+{
+	int i;
+
+	for (i = 0; i < 64; i++) {
+		struct drm_minor *minor;
+
+		minor = drm_minor_acquire(i + DRM_MINOR_CONTROL);
+		if (IS_ERR(minor))
+			continue;
+		if (!minor->dev || !minor->dev->driver ||
+		    !minor->dev->driver->name)
+			continue;
+		if (!name)
+			return minor->dev;
+		if (!strcmp(name, minor->dev->driver->name))
+			return minor->dev;
+	}
+
+	return NULL;
 }
 
 /**

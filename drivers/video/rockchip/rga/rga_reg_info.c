@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 
 //#include <linux/kernel.h>
 #include <linux/memory.h>
@@ -30,6 +31,7 @@
 #include <linux/slab.h>
 #include <linux/fb.h>
 #include <linux/wakelock.h>
+#include <linux/version.h>
 
 #include "rga_reg_info.h"
 #include "rga_rop.h"
@@ -91,7 +93,7 @@ Author:
 Date:
     20012-2-2 10:59:25
 **************************************************************/
-void
+static void
 dst_ctrl_cal(const struct rga_req *msg, TILE_INFO *tile)
 {
     u32 width   = msg->dst.act_w;
@@ -285,7 +287,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 src_tile_info_cal(const struct rga_req *msg, TILE_INFO *tile)
 {
     s32 x0, x1, x2, x3, y0, y1, y2, y3;
@@ -437,7 +439,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 RGA_set_mode_ctrl(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_MODE_CTL;
@@ -561,7 +563,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 RGA_set_src(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_SRC_VIR_INFO;
@@ -670,7 +672,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
+static s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_DST_MST;
     u32 *bRGA_DST_UV_MST;
@@ -703,12 +705,26 @@ s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
 
     *bRGA_DST_UV_MST = 0;
     *bRGA_YUV_OUT_CFG = 0;
+	if (msg->rotate_mode == 1) {
+		if (msg->sina == 65536 && msg->cosa == 0) {
+			/* rotate 90 */
+			x_off = msg->dst.x_offset - msg->dst.act_h + 1;
+		} else if (msg->sina == 0 && msg->cosa == -65536) {
+			/* rotate 180 */
+			x_off = msg->dst.x_offset - msg->dst.act_w + 1;
+			y_off = msg->dst.y_offset - msg->dst.act_h + 1;
+		} else if (msg->sina == -65536 && msg->cosa == 0) {
+			/* totate 270 */
+			y_off = msg->dst.y_offset - msg->dst.act_w + 1;
+		}
+	}
+
     switch(msg->dst.format)
     {
         case RK_FORMAT_YCbCr_422_SP :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off) * pw);
-            *bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off));
-            *bRGA_YUV_OUT_CFG |= (0 << 3) | 1 | (((msg->yuv2rgb_mode >> 4) & 3) << 4);
+			*bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + (y_off * stride) + x_off;
+			*bRGA_YUV_OUT_CFG |= (((msg->yuv2rgb_mode >> 4) & 3) << 4) | (0 << 3) | (0 << 1) | 1;
             break;
         case RK_FORMAT_YCbCr_422_P  :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off>>1) * pw);
@@ -716,8 +732,8 @@ s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
             break;
         case RK_FORMAT_YCbCr_420_SP :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off) * pw);
-            *bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off));
-            *bRGA_YUV_OUT_CFG |= (0 << 3)|(1 << 1) | 1 | (((msg->yuv2rgb_mode >> 4) & 3) << 4);
+			*bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + x_off;
+			*bRGA_YUV_OUT_CFG |= (((msg->yuv2rgb_mode >> 4) & 3) << 4) | (0 << 3) | (1 << 1) | 1;
             break;
         case RK_FORMAT_YCbCr_420_P :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off>>1) * pw);
@@ -725,8 +741,8 @@ s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
             break;
         case RK_FORMAT_YCrCb_422_SP :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off) * pw);
-            *bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off));
-            *bRGA_YUV_OUT_CFG |= (1 << 3)|(0 << 1) | 1 | (((msg->yuv2rgb_mode >> 4) & 3) << 4);
+			*bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + (y_off * stride) + x_off;
+			*bRGA_YUV_OUT_CFG |= (((msg->yuv2rgb_mode >> 4) & 3) << 4) | (1 << 3) | (0 << 1) | 1;
             break;
         case RK_FORMAT_YCrCb_422_P  :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off) * stride) + ((x_off>>1) * pw);
@@ -734,8 +750,8 @@ s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
             break;
         case RK_FORMAT_YCrCb_420_SP :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off) * pw);
-            *bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off));
-            *bRGA_YUV_OUT_CFG |= (1 << 3)|(1 << 1) | 1 | (((msg->yuv2rgb_mode >> 4) & 3) << 4);
+			*bRGA_DST_UV_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + x_off;
+			*bRGA_YUV_OUT_CFG |= (((msg->yuv2rgb_mode >> 4) & 3) << 4) | (1 << 3) | (1 << 1) | 1;
             break;
         case RK_FORMAT_YCrCb_420_P :
             *bRGA_PRESCL_CB_MST = (u32)msg->dst.uv_addr + ((y_off>>1) * stride) + ((x_off>>1) * pw);
@@ -761,11 +777,11 @@ s32 RGA_set_dst(u8 *base, const struct rga_req *msg)
 
     *bRGA_DST_VIR_INFO = reg;
     *bRGA_DST_CTR_INFO = (msg->dst.act_w - 1) | ((msg->dst.act_h - 1) << 16);
-
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0))
     if (msg->render_mode == pre_scaling_mode) {
         *bRGA_YUV_OUT_CFG &= 0xfffffffe;
     }
-
+#endif
     return 0;
 }
 
@@ -780,7 +796,7 @@ Author:
 Date:
     20012-2-2 10:59:25
 **************************************************************/
-void
+static void
 RGA_set_alpha_rop(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_ALPHA_CON;
@@ -842,7 +858,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 RGA_set_color(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_SRC_TR_COLOR0;
@@ -876,7 +892,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-s32
+static s32
 RGA_set_fading(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_FADING_CON;
@@ -908,7 +924,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-s32
+static s32
 RGA_set_pat(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_PAT_CON;
@@ -941,7 +957,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 RGA_set_bitblt_reg_info(u8 *base, const struct rga_req * msg, TILE_INFO *tile)
 {
     u32 *bRGA_SRC_Y_MST;
@@ -1126,7 +1142,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-void
+static void
 RGA_set_color_palette_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_SRC_Y_MST;
@@ -1162,7 +1178,7 @@ Author:
 Date:
     20012-2-2 10:59:25
 **************************************************************/
-void
+static void
 RGA_set_color_fill_reg_info(u8 *base, const struct rga_req *msg)
 {
 
@@ -1201,7 +1217,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-s32 RGA_set_line_drawing_reg_info(u8 *base, const struct rga_req *msg)
+static s32 RGA_set_line_drawing_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_LINE_DRAW;
     u32 *bRGA_DST_VIR_INFO;
@@ -1306,7 +1322,7 @@ s32 RGA_set_line_drawing_reg_info(u8 *base, const struct rga_req *msg)
 
 
 /*full*/
-s32
+static s32
 RGA_set_filter_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_BLUR_SHARP_INFO;
@@ -1326,7 +1342,7 @@ RGA_set_filter_reg_info(u8 *base, const struct rga_req *msg)
 
 
 /*full*/
-s32
+static s32
 RGA_set_pre_scale_reg_info(u8 *base, const struct rga_req *msg)
 {
    u32 *bRGA_PRE_SCALE_INFO;
@@ -1390,7 +1406,7 @@ RGA_set_pre_scale_reg_info(u8 *base, const struct rga_req *msg)
 
 
 /*full*/
-int
+static int
 RGA_set_update_palette_table_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_LUT_MST;
@@ -1409,7 +1425,7 @@ RGA_set_update_palette_table_reg_info(u8 *base, const struct rga_req *msg)
 
 
 /*full*/
-int
+static int
 RGA_set_update_patten_buff_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *bRGA_PAT_MST;
@@ -1452,7 +1468,7 @@ Date:
     20012-2-2 10:59:25
 **************************************************************/
 
-s32
+static s32
 RGA_set_mmu_ctrl_reg_info(u8 *base, const struct rga_req *msg)
 {
     u32 *RGA_MMU_TLB, *RGA_MMU_CTRL_ADDR;

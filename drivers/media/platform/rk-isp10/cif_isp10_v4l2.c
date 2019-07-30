@@ -18,7 +18,8 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
-#include <media/videobuf-dma-contig.h>
+#include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-dma-sg.h>
 #include "cif_isp10.h"
 #include "cif_isp10_regs.h"
 #include "cif_isp10_version.h"
@@ -29,10 +30,10 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 
-#define CIF_ISP10_V4L2_SP_DEV_MAJOR 0
-#define CIF_ISP10_V4L2_ISP_DEV_MAJOR 1
-#define CIF_ISP10_V4L2_MP_DEV_MAJOR 2
-#define CIF_ISP10_V4L2_DMA_DEV_MAJOR 3
+#define CIF_ISP10_V4L2_SP_DEV_MAJOR -1
+#define CIF_ISP10_V4L2_ISP_DEV_MAJOR -1
+#define CIF_ISP10_V4L2_MP_DEV_MAJOR -1
+#define CIF_ISP10_V4L2_DMA_DEV_MAJOR -1
 
 #define SP_DEV 0
 #define MP_DEV 1
@@ -47,8 +48,12 @@ struct cif_isp10_v4l2_fh {
 
 /* One structure per video node */
 struct cif_isp10_v4l2_node {
-	struct videobuf_queue buf_queue;
+	struct vb2_queue buf_queue;
+	/* queue lock */
+	struct mutex qlock;
 	struct video_device vdev;
+	struct media_pad pad;
+	struct cif_isp10_pipeline *pipe;
 	int users;
 	struct cif_isp10_v4l2_fh *owner;
 };
@@ -57,9 +62,6 @@ struct cif_isp10_v4l2_node {
 struct cif_isp10_v4l2_device {
 	struct cif_isp10_v4l2_node node[4];
 };
-
-/* spinlock define */
-spinlock_t iowrite32_verify_lock;
 
 static struct cif_isp10_v4l2_fh *to_fh(struct file *file)
 {
@@ -79,13 +81,24 @@ static struct cif_isp10_v4l2_node *to_node(struct cif_isp10_v4l2_fh *fh)
 	return container_of(vdev, struct cif_isp10_v4l2_node, vdev);
 }
 
-static struct videobuf_queue *to_videobuf_queue(
+static inline struct cif_isp10_v4l2_node *queue_to_node(struct vb2_queue *q)
+{
+	return container_of(q, struct cif_isp10_v4l2_node, buf_queue);
+}
+
+static inline struct cif_isp10_buffer *to_cif_isp10_vb(
+	struct vb2_v4l2_buffer *vb)
+{
+	return container_of(vb, struct cif_isp10_buffer, vb);
+}
+
+static struct vb2_queue *to_vb2_queue(
 	struct file *file)
 {
 	struct cif_isp10_v4l2_fh *fh = to_fh(file);
 	struct video_device *vdev = fh ? fh->fh.vdev : NULL;
 	struct cif_isp10_v4l2_node *node = to_node(fh);
-	struct videobuf_queue *q;
+	struct vb2_queue *q;
 
 	if (unlikely(!vdev)) {
 		cif_isp10_pltfrm_pr_err(NULL,
@@ -123,13 +136,13 @@ static enum cif_isp10_stream_id to_stream_id(
 }
 
 static struct cif_isp10_device *to_cif_isp10_device(
-	struct videobuf_queue *queue)
+	struct vb2_queue *queue)
 {
-	return queue->priv_data;
+	return queue->drv_priv;
 }
 
 static enum cif_isp10_stream_id to_cif_isp10_stream_id(
-	struct videobuf_queue *queue)
+	struct vb2_queue *queue)
 {
 	struct cif_isp10_v4l2_node *node =
 		container_of(queue, struct cif_isp10_v4l2_node, buf_queue);
@@ -269,6 +282,10 @@ static int cif_isp10_v4l2_cid2cif_isp10_cid(u32 v4l2_cid)
 		return CIF_ISP10_CID_ISO_SENSITIVITY;
 	case RK_V4L2_CID_AUTO_FPS:
 		return CIF_ISP10_CID_AUTO_FPS;
+	case V4L2_CID_MIN_BUFFERS_FOR_CAPTURE:
+		return CIF_ISP10_CID_MIN_BUFFER_FOR_CAPTURE;
+	case V4L2_CID_TEST_PATTERN:
+		return CIF_ISP10_CID_TEST_PATTERN;
 	default:
 		cif_isp10_pltfrm_pr_err(NULL,
 			"unknown/unsupported V4L2 CID 0x%x\n",
@@ -304,7 +321,7 @@ static enum cif_isp10_image_effect cif_isp10_v4l2_colorfx2cif_isp10_ie(
 }
 
 static enum cif_isp10_pix_fmt cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
-	u32 v4l2_pix_fmt, struct videobuf_queue *queue)
+	u32 v4l2_pix_fmt, struct vb2_queue *queue)
 {
 /*struct cif_isp10_v4l2_node *node =
  *	container_of(queue, struct cif_isp10_v4l2_node, buf_queue);
@@ -315,6 +332,10 @@ static enum cif_isp10_pix_fmt cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
 	switch (v4l2_pix_fmt) {
 	case V4L2_PIX_FMT_GREY:
 		return CIF_YUV400;
+	case V4L2_PIX_FMT_Y10:
+		return CIF_Y10;
+	case V4L2_PIX_FMT_Y12:
+		return CIF_Y12;
 	case V4L2_PIX_FMT_YUV420:
 		return CIF_YUV420P;
 	case V4L2_PIX_FMT_YVU420:
@@ -325,6 +346,8 @@ static enum cif_isp10_pix_fmt cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
 		return CIF_YVU420SP;
 	case V4L2_PIX_FMT_YUYV:
 		return CIF_YUV422I;
+	case V4L2_PIX_FMT_YVYU:
+		return CIF_YVU422I;
 	case V4L2_PIX_FMT_UYVY:
 		return CIF_UYV422I;
 	case V4L2_PIX_FMT_YUV422P:
@@ -376,6 +399,76 @@ static enum cif_isp10_pix_fmt cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
 	}
 }
 
+static u32 cif_isp10_pix_fmt2v4l2_pix_fmt(
+		enum cif_isp10_pix_fmt pix_fmt, struct vb2_queue *queue)
+{
+/*struct cif_isp10_v4l2_node *node =
+ *	container_of(queue, struct cif_isp10_v4l2_node, buf_queue);
+ *	struct video_device *vdev =
+ *	&node->vdev;
+ */
+
+	switch (pix_fmt) {
+	case CIF_YUV400:
+		return V4L2_PIX_FMT_GREY;
+	case CIF_YUV420P:
+		return V4L2_PIX_FMT_YUV420;
+	case CIF_YVU420P:
+		return V4L2_PIX_FMT_YVU420;
+	case CIF_YUV420SP:
+		return V4L2_PIX_FMT_NV12;
+	case CIF_YVU420SP:
+		return V4L2_PIX_FMT_NV21;
+	case CIF_YUV422I:
+		return V4L2_PIX_FMT_YUYV;
+	case CIF_UYV422I:
+		return V4L2_PIX_FMT_UYVY;
+	case CIF_YUV422P:
+		return V4L2_PIX_FMT_YUV422P;
+	case CIF_YUV422SP:
+		return V4L2_PIX_FMT_NV16;
+	case CIF_YUV444P:
+		return V4L2_PIX_FMT_YUV444;
+	case CIF_YUV444SP:
+		return V4L2_PIX_FMT_NV24;
+	case CIF_RGB565:
+		return V4L2_PIX_FMT_RGB565;
+	case CIF_RGB888:
+		return V4L2_PIX_FMT_RGB24;
+	case CIF_BAYER_SBGGR8:
+		return V4L2_PIX_FMT_SBGGR8;
+	case CIF_BAYER_SGBRG8:
+		return V4L2_PIX_FMT_SGBRG8;
+	case CIF_BAYER_SGRBG8:
+		return V4L2_PIX_FMT_SGRBG8;
+	case CIF_BAYER_SRGGB8:
+		return V4L2_PIX_FMT_SRGGB8;
+	case CIF_BAYER_SBGGR10:
+		return V4L2_PIX_FMT_SBGGR10;
+	case CIF_BAYER_SGBRG10:
+		return V4L2_PIX_FMT_SGBRG10;
+	case CIF_BAYER_SGRBG10:
+		return V4L2_PIX_FMT_SGRBG10;
+	case CIF_BAYER_SRGGB10:
+		return V4L2_PIX_FMT_SRGGB10;
+	case CIF_BAYER_SBGGR12:
+		return V4L2_PIX_FMT_SBGGR12;
+	case CIF_BAYER_SGBRG12:
+		return V4L2_PIX_FMT_SGBRG12;
+	case CIF_BAYER_SGRBG12:
+		return V4L2_PIX_FMT_SGRBG12;
+	case CIF_BAYER_SRGGB12:
+		return V4L2_PIX_FMT_SRGGB12;
+	case CIF_JPEG:
+		return V4L2_PIX_FMT_JPEG;
+	default:
+		cif_isp10_pltfrm_pr_err(NULL,
+			"unknown or unsupported V4L2 pixel format %x\n",
+			pix_fmt);
+		return 0;
+	}
+}
+
 static int cif_isp10_v4l2_register_video_device(
 	struct cif_isp10_device *dev,
 	struct video_device *vdev,
@@ -419,31 +512,52 @@ err:
 	return ret;
 }
 
+static int cif_isp10_v4l2_register_imgsrc_subdev(
+	struct cif_isp10_device *dev)
+{
+	unsigned int i;
+	struct v4l2_subdev *sd;
+
+	for (i = 0; i < dev->img_src_cnt; i++) {
+		if (dev->img_src_array[i] != NULL) {
+			sd = (struct v4l2_subdev *)
+				cif_isp10_img_src_g_img_src(
+					dev->img_src_array[i]);
+			if (sd) {
+				if (v4l2_device_register_subdev(
+					&dev->v4l2_dev,
+					sd) < 0)
+					cif_isp10_pltfrm_pr_err(dev->dev,
+						"register subdev(%s) failed!",
+						cif_isp10_img_src_g_name(dev->img_src_array[i]));
+			}
+		}
+	}
+
+	return v4l2_device_register_subdev_nodes(&dev->v4l2_dev);
+}
+
 static int cif_isp10_v4l2_streamon(
 	struct file *file,
 	void *priv,
 	enum v4l2_buf_type buf_type)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	static u32 streamon_cnt_sp;
 	static u32 streamon_cnt_mp;
 	static u32 streamon_cnt_dma;
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	struct cif_isp10_v4l2_node *node = to_node(fh);
 	u32 stream_ids = to_stream_id(file);
 
-	if (node->owner != fh)
-		return -EBUSY;
-
+	mutex_lock(&dev->api_mutex);
 	cif_isp10_pltfrm_pr_dbg(dev->dev, "%s(%d)\n",
 		cif_isp10_v4l2_buf_type_string(queue->type),
 		(stream_ids & CIF_ISP10_STREAM_MP) ? ++streamon_cnt_mp :
 		((stream_ids & CIF_ISP10_STREAM_SP) ? ++streamon_cnt_sp :
 		++streamon_cnt_dma));
 
-	ret = videobuf_streamon(queue);
+	ret = vb2_streamon(queue, buf_type);
 	if (IS_ERR_VALUE(ret)) {
 		cif_isp10_pltfrm_pr_err(dev->dev,
 			"videobuf_streamon failed\n");
@@ -452,14 +566,15 @@ static int cif_isp10_v4l2_streamon(
 
 	ret = cif_isp10_streamon(dev, stream_ids);
 	if (IS_ERR_VALUE(ret)) {
-		videobuf_queue_cancel(queue);
 		goto err;
 	}
 
+	mutex_unlock(&dev->api_mutex);
 	return 0;
 err:
-	(void)videobuf_mmap_free(queue);
+	(void)vb2_queue_release(queue);
 	cif_isp10_pltfrm_pr_err(dev->dev, "failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -468,31 +583,20 @@ static int cif_isp10_v4l2_do_streamoff(
 {
 	int ret = 0;
 	int err;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	struct cif_isp10_v4l2_node *node = to_node(fh);
 	u32 stream_ids = to_stream_id(file);
 
 	cif_isp10_pltfrm_pr_dbg(dev->dev, "%s\n",
 		cif_isp10_v4l2_buf_type_string(queue->type));
 
-	if (node->owner != fh)
-		return -EBUSY;
-
 	err = cif_isp10_streamoff(dev, stream_ids);
 	if (IS_ERR_VALUE(err))
 		ret = -EFAULT;
-	err = videobuf_streamoff(queue);
+	err = vb2_streamoff(queue, queue->type);
 	if (IS_ERR_VALUE(err)) {
 		cif_isp10_pltfrm_pr_err(dev->dev,
 			"videobuf_streamoff failed with error %d\n", err);
-		ret = -EFAULT;
-	}
-	err = videobuf_mmap_free(queue);
-	if (IS_ERR_VALUE(err)) {
-		cif_isp10_pltfrm_pr_err(dev->dev,
-			"videobuf_mmap_free failed with error %d\n", err);
 		ret = -EFAULT;
 	}
 
@@ -508,12 +612,17 @@ static int cif_isp10_v4l2_streamoff(
 	void *priv,
 	enum v4l2_buf_type buf_type)
 {
-	int ret = cif_isp10_v4l2_do_streamoff(file);
+	int ret;
+	struct vb2_queue *queue = to_vb2_queue(file);
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 
+	mutex_lock(&dev->api_mutex);
+	ret = cif_isp10_v4l2_do_streamoff(file);
 	if (IS_ERR_VALUE(ret))
 		cif_isp10_pltfrm_pr_err(NULL,
 			"failed with error %d\n", ret);
 
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -523,20 +632,8 @@ static int cif_isp10_v4l2_qbuf(
 	struct v4l2_buffer *buf)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	struct cif_isp10_v4l2_node *node = to_node(fh);
 
-	cif_isp10_pltfrm_pr_dbg(NULL,
-		"%s buffer type %s, index %d, length %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		cif_isp10_v4l2_buf_type_string(buf->type),
-		buf->index, buf->length);
-
-	if (node->owner != fh)
-		return -EBUSY;
-
-	ret = videobuf_qbuf(queue, buf);
+	ret = vb2_ioctl_qbuf(file, priv, buf);
 	if (IS_ERR_VALUE(ret))
 		cif_isp10_pltfrm_pr_err(NULL,
 			"videobuf_qbuf failed with error %d\n", ret);
@@ -549,17 +646,8 @@ static int cif_isp10_v4l2_dqbuf(
 	struct v4l2_buffer *buf)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	struct cif_isp10_v4l2_node *node = to_node(fh);
 
-	cif_isp10_pltfrm_pr_dbg(NULL, "%s\n",
-		cif_isp10_v4l2_buf_type_string(queue->type));
-
-	if (node->owner != fh)
-		return -EBUSY;
-
-	ret = videobuf_dqbuf(queue, buf, file->f_flags & O_NONBLOCK);
+	ret = vb2_ioctl_dqbuf(file, priv, buf);
 	if (IS_ERR_VALUE(ret) && (ret != -EAGAIN))
 		cif_isp10_pltfrm_pr_err(NULL,
 			"videobuf_dqbuf failed with error %d\n", ret);
@@ -570,157 +658,24 @@ static int cif_isp10_v4l2_dqbuf(
 	return ret;
 }
 
-static void cif_isp10_v4l2_buf_release(
-	struct videobuf_queue *queue,
-	struct videobuf_buffer *buf)
-{
-	cif_isp10_pltfrm_pr_dbg(NULL,
-		"%s\n",
-		cif_isp10_v4l2_buf_type_string(queue->type));
-
-	if (in_interrupt())
-		WARN_ON(1);
-
-	videobuf_dma_contig_free(queue, buf);
-
-	buf->state = VIDEOBUF_NEEDS_INIT;
-}
-
-static void cif_isp10_v4l2_buf_queue(
-	struct videobuf_queue *queue,
-	struct videobuf_buffer *buf)
-{
-	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
-	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
-
-	cif_isp10_pltfrm_pr_dbg(NULL,
-		"%s %dx%d, size %lu, bytesperline %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		buf->width, buf->height, buf->size, buf->bytesperline);
-
-	if (!IS_ERR_VALUE(cif_isp10_qbuf(dev, strm, buf)))
-		buf->state = VIDEOBUF_QUEUED;
-	else
-		cif_isp10_pltfrm_pr_err(NULL, "failed\n");
-}
-
-static int cif_isp10_v4l2_buf_setup(
-	struct videobuf_queue *queue,
-	unsigned int *cnt,
-	unsigned int *size)
-{
-	int ret;
-	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
-	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
-
-	cif_isp10_pltfrm_pr_dbg(NULL, "%s count %d, size %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		*cnt, *size);
-
-	ret = cif_isp10_calc_min_out_buff_size(
-		dev, strm, size);
-	if (IS_ERR_VALUE(ret)) {
-		cif_isp10_pltfrm_pr_err(NULL, "failed with error %d\n", ret);
-		return ret;
-	}
-
-	cif_isp10_pltfrm_pr_dbg(NULL, "%s count %d, size %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		*cnt, *size);
-
-	return 0;
-}
-
-static int cif_isp10_v4l2_buf_prepare(
-	struct videobuf_queue *queue,
-	struct videobuf_buffer *buf,
-	enum v4l2_field field)
-{
-	int ret;
-	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
-	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
-	u32 size;
-
-	cif_isp10_pltfrm_pr_dbg(NULL, "%s\n",
-		cif_isp10_v4l2_buf_type_string(queue->type));
-
-	ret = cif_isp10_calc_min_out_buff_size(
-		dev, strm, &size);
-	if (IS_ERR_VALUE(ret))
-		goto err;
-	buf->size = size;
-	if (strm == CIF_ISP10_STREAM_SP) {
-		buf->width =
-			dev->config.mi_config.sp.output.width;
-		buf->height =
-			dev->config.mi_config.sp.output.height;
-	} else if (strm == CIF_ISP10_STREAM_MP) {
-		buf->width =
-			dev->config.mi_config.mp.output.width;
-		buf->height =
-			dev->config.mi_config.mp.output.height;
-	} else if (strm == CIF_ISP10_STREAM_DMA) {
-		buf->width =
-			dev->config.mi_config.dma.output.width;
-		buf->height =
-			dev->config.mi_config.dma.output.height;
-	} else {
-		cif_isp10_pltfrm_pr_err(NULL,
-			"wrong buffer queue %d\n", queue->type);
-		ret = -EINVAL;
-		goto err;
-	}
-	buf->field = field;
-
-	cif_isp10_pltfrm_pr_dbg(NULL, "%s buffer prepared %dx%d, size %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		buf->width, buf->height, size);
-
-	if (buf->state == VIDEOBUF_NEEDS_INIT) {
-		ret = videobuf_iolock(queue, buf, NULL);
-		if (IS_ERR_VALUE(ret)) {
-			cif_isp10_pltfrm_pr_err(NULL,
-				"videobuf_iolock failed with error %d\n", ret);
-			goto err;
-		}
-	}
-	buf->state = VIDEOBUF_PREPARED;
-
-	return 0;
-err:
-	cif_isp10_pltfrm_pr_err(NULL, "failed with error %d\n", ret);
-	cif_isp10_v4l2_buf_release(queue, buf);
-	return ret;
-}
-
 static int cif_isp10_v4l2_reqbufs(
 	struct file *file,
 	void *priv,
 	struct v4l2_requestbuffers *req)
 {
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	struct cif_isp10_v4l2_node *node = to_node(fh);
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
 
-	cif_isp10_pltfrm_pr_dbg(NULL,
-		"%s requested type %s, count %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type),
-		cif_isp10_v4l2_buf_type_string(req->type),
-		req->count);
-
-	if (node->owner && node->owner != fh)
-		return -EBUSY;
-	node->owner = fh;
-
-	ret = videobuf_reqbufs(queue, req);
+	mutex_lock(&dev->api_mutex);
+	ret = vb2_ioctl_reqbufs(file, priv, req);
 	if (IS_ERR_VALUE(ret)) {
 		cif_isp10_pltfrm_pr_err(NULL,
 			"videobuf_reqbufs failed with error %d\n", ret);
 	}
 	cif_isp10_reqbufs(dev, strm, req);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -730,16 +685,15 @@ static int cif_isp10_v4l2_querybuf(
 	struct v4l2_buffer *buf)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 
-	cif_isp10_pltfrm_pr_dbg(NULL,
-		"%s, index %d\n",
-		cif_isp10_v4l2_buf_type_string(queue->type), buf->index);
-
-	ret = videobuf_querybuf(queue, buf);
+	mutex_lock(&dev->api_mutex);
+	ret = vb2_ioctl_querybuf(file, priv, buf);
 	if (IS_ERR_VALUE(ret))
 		cif_isp10_pltfrm_pr_err(NULL,
 			"videobuf_querybuf failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 
 	return ret;
 }
@@ -749,15 +703,17 @@ static int cif_isp10_v4l2_s_ctrl(
 	void *priv,
 	struct v4l2_control *vc)
 {
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	enum cif_isp10_cid id =
 		cif_isp10_v4l2_cid2cif_isp10_cid(vc->id);
 	int val = vc->value;
+	int ret;
 
 	if (IS_ERR_VALUE(id))
 		return id;
 
+	mutex_lock(&dev->api_mutex);
 	switch (vc->id) {
 	case V4L2_CID_COLORFX:
 		val = cif_isp10_v4l2_colorfx2cif_isp10_ie(val);
@@ -776,7 +732,9 @@ static int cif_isp10_v4l2_s_ctrl(
 		break;
 	}
 
-	return cif_isp10_s_ctrl(dev, id, val);
+	ret = cif_isp10_s_ctrl(dev, id, val);
+	mutex_unlock(&dev->api_mutex);
+	return ret;
 }
 
 static int cif_isp10_v4l2_s_fmt(
@@ -785,7 +743,7 @@ static int cif_isp10_v4l2_s_fmt(
 	struct v4l2_format *f)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	struct cif_isp10_v4l2_fh *fh = to_fh(file);
 	struct cif_isp10_v4l2_node *node = to_node(fh);
@@ -795,8 +753,11 @@ static int cif_isp10_v4l2_s_fmt(
 		"%s\n",
 		cif_isp10_v4l2_buf_type_string(queue->type));
 
-	if (node->owner && node->owner != fh)
+	mutex_lock(&dev->api_mutex);
+	if (node->owner && node->owner != fh) {
+		mutex_unlock(&dev->api_mutex);
 		return -EBUSY;
+	}
 
 	strm_fmt.frm_fmt.pix_fmt =
 		cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
@@ -809,13 +770,22 @@ static int cif_isp10_v4l2_s_fmt(
 		to_stream_id(file),
 		&strm_fmt,
 		f->fmt.pix.bytesperline);
+
+	//TODO:: check s_fmt format field and size;
+	f->fmt.pix.field = V4L2_FIELD_NONE;
+	cif_isp10_calc_min_out_buff_size(dev,
+		to_stream_id(file), &f->fmt.pix.sizeimage, false);
+	//f->fmt.pix.sizeimage = PAGE_ALIGN(f->fmt.pix.sizeimage);
+
 	if (IS_ERR_VALUE(ret))
 		goto err;
 
+	mutex_unlock(&dev->api_mutex);
 	return 0;
 err:
 	cif_isp10_pltfrm_pr_err(NULL,
 		"failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -825,7 +795,59 @@ static int cif_isp10_v4l2_g_fmt(
 	void *priv,
 	struct v4l2_format *f)
 {
-	return -EFAULT;
+	enum cif_isp10_pix_fmt pix_fmt;
+	struct vb2_queue *queue = to_vb2_queue(file);
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+	enum cif_isp10_stream_id stream_id = to_cif_isp10_stream_id(queue);
+
+	mutex_lock(&dev->api_mutex);
+	switch (stream_id) {
+	case CIF_ISP10_STREAM_SP:
+		pix_fmt = dev->config.mi_config.sp.output.pix_fmt;
+		f->fmt.pix.width =
+			dev->config.mi_config.sp.output.width;
+		f->fmt.pix.height =
+			dev->config.mi_config.sp.output.height;
+		f->fmt.pix.pixelformat = cif_isp10_pix_fmt2v4l2_pix_fmt(pix_fmt, queue);
+		break;
+	case CIF_ISP10_STREAM_MP:
+		pix_fmt = dev->config.mi_config.mp.output.pix_fmt;
+		f->fmt.pix.width =
+			dev->config.mi_config.mp.output.width;
+		f->fmt.pix.height =
+			dev->config.mi_config.mp.output.height;
+		f->fmt.pix.pixelformat = cif_isp10_pix_fmt2v4l2_pix_fmt(pix_fmt, queue);
+		break;
+	default:
+		mutex_unlock(&dev->api_mutex);
+		return -EINVAL;
+	}
+
+	mutex_unlock(&dev->api_mutex);
+	return 0;
+}
+
+static int cif_isp10_v4l2_g_input(
+	struct file *file,
+	void *priv,
+	unsigned int *i)
+{
+	int ret;
+	struct vb2_queue *queue = to_vb2_queue(file);
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+
+	mutex_lock(&dev->api_mutex);
+	ret = cif_isp10_g_input(dev, i);
+	if (IS_ERR_VALUE(ret))
+		goto err;
+
+	mutex_unlock(&dev->api_mutex);
+	return 0;
+err:
+	cif_isp10_pltfrm_pr_err(NULL,
+		"failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
+	return ret;
 }
 
 static int cif_isp10_v4l2_s_input(
@@ -834,19 +856,22 @@ static int cif_isp10_v4l2_s_input(
 	unsigned int i)
 {
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 
 	cif_isp10_pltfrm_pr_dbg(dev->dev, "setting input to %d\n", i);
 
+	mutex_lock(&dev->api_mutex);
 	ret = cif_isp10_s_input(dev, i);
 	if (IS_ERR_VALUE(ret))
 		goto err;
 
+	mutex_unlock(&dev->api_mutex);
 	return 0;
 err:
 	cif_isp10_pltfrm_pr_err(NULL,
 		"failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -857,9 +882,11 @@ static int cif_isp10_v4l2_enum_framesizes(
 {
 	/* THIS FUNCTION IS UNDER CONSTRUCTION */
 	int ret;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+	struct v4l2_subdev_frame_size_enum fse;
 
+	mutex_lock(&dev->api_mutex);
 	if (IS_ERR_OR_NULL(dev->img_src)) {
 		cif_isp10_pltfrm_pr_err(NULL,
 			"input has not yet been selected, cannot enumerate formats\n");
@@ -867,20 +894,162 @@ static int cif_isp10_v4l2_enum_framesizes(
 		goto err;
 	}
 
-	return -EINVAL;
+	memset(&fse, 0x00, sizeof(fse));
+	fse.index = fsize->index;
+
+	ret = cif_isp10_img_src_enum_frame_size(dev->img_src, &fse);
+	if (IS_ERR_VALUE(ret))
+		goto err;
+
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+
+	fsize->discrete.width = fse.max_width;
+	fsize->discrete.height = fse.max_height;
+
+	mutex_unlock(&dev->api_mutex);
+	return 0;
+
 err:
-	cif_isp10_pltfrm_pr_err(NULL, "failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
-/* fops **********************************************************************/
+static int cif_isp10_v4l2_vb2_queue_setup(struct vb2_queue *queue,
+			const void *parg,
+			unsigned int *num_buffers, unsigned int *num_planes,
+			unsigned int sizes[], void *alloc_ctxs[])
+{
+	int ret;
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
 
-const struct videobuf_queue_ops cif_isp10_qops = {
-	.buf_setup = cif_isp10_v4l2_buf_setup,
-	.buf_prepare = cif_isp10_v4l2_buf_prepare,
-	.buf_queue = cif_isp10_v4l2_buf_queue,
-	.buf_release = cif_isp10_v4l2_buf_release,
+	cif_isp10_pltfrm_pr_dbg(NULL,
+		"%s request planes %d count %d, size %d\n",
+		cif_isp10_v4l2_buf_type_string(queue->type),
+		*num_planes,
+		*num_buffers, sizes[0]);
+
+	if (*num_planes == 0)
+		*num_planes = 1;
+
+	if (*num_buffers == 0)
+		*num_buffers = 4;
+
+	alloc_ctxs[0] = dev->alloc_ctx;
+
+	ret = cif_isp10_calc_min_out_buff_size(dev, strm, &sizes[0], false);
+	//sizes[0] = PAGE_ALIGN(sizes[0] );
+	if (ret)
+		return -EINVAL;
+
+	cif_isp10_pltfrm_pr_dbg(NULL, "%s count %d, size %d\n",
+		cif_isp10_v4l2_buf_type_string(queue->type),
+		*num_buffers, sizes[0]);
+
+	return 0;
+}
+
+static void cif_isp10_v4l2_vb2_queue(struct vb2_buffer *vb)
+{
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct cif_isp10_buffer *ispbuf = to_cif_isp10_vb(vbuf);
+	struct vb2_queue *queue = vb->vb2_queue;
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
+	struct cif_isp10_stream *stream = to_stream_by_id(dev, strm);
+	u32 size;
+	unsigned long lock_flags = 0;
+
+	cif_isp10_pltfrm_pr_dbg(NULL,
+		"buffer type %s\n",
+		cif_isp10_v4l2_buf_type_string(queue->type));
+
+	spin_lock_irqsave(&dev->vbq_lock, lock_flags);
+	list_add_tail(&ispbuf->queue, &stream->buf_queue);
+
+	cif_isp10_calc_min_out_buff_size(dev, strm, &size, false);
+	//size = PAGE_ALIGN(size);
+	vb2_set_plane_payload(vb, 0, size);
+	spin_unlock_irqrestore(&dev->vbq_lock, lock_flags);
+}
+
+static void cif_isp10_v4l2_vb2_stop_streaming(struct vb2_queue *queue)
+{
+	struct cif_isp10_v4l2_node *node;
+	enum cif_isp10_stream_id strm = to_cif_isp10_stream_id(queue);
+	struct cif_isp10_stream *stream = NULL;
+	struct cif_isp10_device *dev;
+	struct cif_isp10_buffer *buf, *buf_tmp;
+	unsigned long lock_flags = 0;
+
+	node = queue_to_node(queue);
+
+	dev = video_get_drvdata(&node->vdev);
+
+	stream = to_stream_by_id(dev, strm);
+
+	spin_lock_irqsave(&dev->vbq_lock, lock_flags);
+
+	if (stream->curr_buf) {
+		vb2_buffer_done(&stream->curr_buf->vb.vb2_buf,
+			VB2_BUF_STATE_ERROR);
+		stream->curr_buf = NULL;
+	}
+	if (stream->next_buf) {
+		vb2_buffer_done(&stream->next_buf->vb.vb2_buf,
+			VB2_BUF_STATE_ERROR);
+		stream->next_buf = NULL;
+	}
+
+	list_for_each_entry_safe(buf, buf_tmp, &stream->buf_queue, queue) {
+		list_del(&buf->queue);
+		if (buf->vb.vb2_buf.state == VB2_BUF_STATE_ACTIVE)
+			vb2_buffer_done(&buf->vb.vb2_buf,
+				VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&dev->vbq_lock, lock_flags);
+}
+
+static struct vb2_ops cif_isp10_v4l2_vb2_ops = {
+	.queue_setup	= cif_isp10_v4l2_vb2_queue_setup,
+	.buf_queue	= cif_isp10_v4l2_vb2_queue,
+	//.buf_cleanup	= cif_isp10_v4l2_vb2_release,
+	//.buf_init	= cif_isp10_v4l2_vb2_init,
+	.wait_prepare	= vb2_ops_wait_prepare,
+	.wait_finish	= vb2_ops_wait_finish,
+	.stop_streaming	= cif_isp10_v4l2_vb2_stop_streaming,
 };
+
+static int cif_isp10_init_vb2_queue(struct vb2_queue *q,
+	struct cif_isp10_device *dev,
+	enum v4l2_buf_type buf_type)
+{
+	struct cif_isp10_v4l2_node *node;
+
+	memset(q, 0, sizeof(*q));
+	node = queue_to_node(q);
+	mutex_init(&node->qlock);
+
+	q->type = buf_type;
+	q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF;
+	q->drv_priv = dev;
+	q->ops = &cif_isp10_v4l2_vb2_ops;
+	q->buf_struct_size = sizeof(struct cif_isp10_buffer);
+	q->min_buffers_needed	= 4;
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->lock = &node->qlock;
+
+#ifdef CIF_ISP10_MODE_DMA_CONTIG
+	q->mem_ops = &vb2_dma_contig_memops;
+	dev->alloc_ctx = vb2_dma_contig_init_ctx(dev->dev);
+#endif
+
+#ifdef CIF_ISP10_MODE_DMA_SG
+	q->mem_ops = &vb2_dma_sg_memops;
+	dev->alloc_ctx = vb2_dma_sg_init_ctx(dev->dev);
+#endif
+	return vb2_queue_init(q);
+}
 
 static int cif_isp10_v4l2_open(
 	struct file *file)
@@ -899,8 +1068,9 @@ static int cif_isp10_v4l2_open(
 		"video device video%d.%d (%s)\n",
 		vdev->num, vdev->minor, vdev->name);
 
+	mutex_lock(&dev->api_mutex);
 	if (vdev->minor == cif_isp10_v4l2_dev->node[SP_DEV].vdev.minor) {
-		buf_type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
+		buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		stream_id = CIF_ISP10_STREAM_SP;
 	} else if (vdev->minor == cif_isp10_v4l2_dev->node[MP_DEV].vdev.minor) {
 		buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -931,21 +1101,17 @@ static int cif_isp10_v4l2_open(
 	v4l2_fh_add(&fh->fh);
 
 	node = to_node(fh);
-	if (++node->users > 1)
+	if (++node->users > 1) {
+		mutex_unlock(&dev->api_mutex);
 		return 0;
+	}
 
 	/* First open of the device, so initialize everything */
 	node->owner = NULL;
+	dev->img_src_exps.inited = false;
 
-	videobuf_queue_dma_contig_init(
-		to_videobuf_queue(file),
-		&cif_isp10_qops,
-		dev->dev,
-		&dev->vbq_lock,
-		buf_type,
-		V4L2_FIELD_NONE,
-		sizeof(struct videobuf_buffer),
-		dev, NULL);
+	cif_isp10_init_vb2_queue(to_vb2_queue(file), dev, buf_type);
+	vdev->queue = to_vb2_queue(file);
 
 	ret = cif_isp10_init(dev, to_stream_id(file));
 	if (IS_ERR_VALUE(ret)) {
@@ -956,17 +1122,19 @@ static int cif_isp10_v4l2_open(
 		goto err;
 	}
 
+	mutex_unlock(&dev->api_mutex);
 	return 0;
 err:
 	cif_isp10_pltfrm_pr_err(NULL,
 		"failed with error %d\n", ret);
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
 static int cif_isp10_v4l2_release(struct file *file)
 {
 	int ret = 0;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	struct cif_isp10_v4l2_fh *fh = to_fh(file);
 	struct cif_isp10_v4l2_node *node = to_node(fh);
@@ -975,11 +1143,13 @@ static int cif_isp10_v4l2_release(struct file *file)
 	cif_isp10_pltfrm_pr_dbg(dev->dev, "%s\n",
 		cif_isp10_v4l2_buf_type_string(queue->type));
 
+	mutex_lock(&dev->api_mutex);
 	if (node->users) {
 		--node->users;
 	} else {
 		cif_isp10_pltfrm_pr_warn(dev->dev,
 			"number of users for this device is already 0\n");
+		mutex_unlock(&dev->api_mutex);
 		return 0;
 	}
 
@@ -991,10 +1161,15 @@ static int cif_isp10_v4l2_release(struct file *file)
 
 		/* Last close, so uninitialize hardware */
 		ret = cif_isp10_release(dev, stream_id);
+
+		vb2_queue_release(queue);
 	}
 
 	if (node->owner == fh)
 		node->owner = NULL;
+
+	if (file->private_data == queue->owner)
+		queue->owner = NULL;
 
 	v4l2_fh_del(&fh->fh);
 	v4l2_fh_exit(&fh->fh);
@@ -1003,17 +1178,31 @@ static int cif_isp10_v4l2_release(struct file *file)
 	if (IS_ERR_VALUE(ret))
 		cif_isp10_pltfrm_pr_err(dev->dev,
 			"failed with error %d\n", ret);
+
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
+
+static bool cifisp10_meta_mmap;
+module_param_named(meta_mmap, cifisp10_meta_mmap, bool, 0644);
+MODULE_PARM_DESC(meta_mmap, "Meta mmap onoff (N-Y)");
 
 static unsigned int cif_isp10_v4l2_poll(
 	struct file *file,
 	struct poll_table_struct *wait)
 {
-	struct cif_isp10_v4l2_fh *fh = to_fh(file);
-	int ret = 0;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
-	unsigned long req_events = poll_requested_events(wait);
+	struct cif_isp10_v4l2_fh *fh;
+	int ret;
+	struct vb2_queue *queue;
+	unsigned long req_events;
+
+	if (!cifisp10_meta_mmap)
+		return vb2_fop_poll(file, wait);
+
+	ret = 0;
+	fh = to_fh(file);
+	queue = to_vb2_queue(file);
+	req_events = poll_requested_events(wait);
 
 	cif_isp10_pltfrm_pr_dbg(NULL, "%s\n",
 		cif_isp10_v4l2_buf_type_string(queue->type));
@@ -1026,7 +1215,7 @@ static unsigned int cif_isp10_v4l2_poll(
 	if (!(req_events & (POLLIN | POLLOUT | POLLRDNORM)))
 		return ret;
 
-	ret |= videobuf_poll_stream(file, queue, wait);
+	ret |= vb2_fop_poll(file, wait);
 	if (ret & POLLERR) {
 		cif_isp10_pltfrm_pr_err(NULL,
 			"videobuf_poll_stream failed with error 0x%x\n", ret);
@@ -1039,18 +1228,24 @@ static unsigned int cif_isp10_v4l2_poll(
  */
 static void cif_isp10_v4l2_vm_open(struct vm_area_struct *vma)
 {
+	unsigned long flags = 0;
 	struct cif_isp10_metadata_s *metadata =
 		(struct cif_isp10_metadata_s *)vma->vm_private_data;
 
+	spin_lock_irqsave(&metadata->spinlock, flags);
 	metadata->vmas++;
+	spin_unlock_irqrestore(&metadata->spinlock, flags);
 }
 
 static void cif_isp10_v4l2_vm_close(struct vm_area_struct *vma)
 {
+	unsigned long flags = 0;
 	struct cif_isp10_metadata_s *metadata =
 		(struct cif_isp10_metadata_s *)vma->vm_private_data;
 
+	spin_lock_irqsave(&metadata->spinlock, flags);
 	metadata->vmas--;
+	spin_unlock_irqrestore(&metadata->spinlock, flags);
 }
 
 static const struct vm_operations_struct cif_isp10_vm_ops = {
@@ -1060,11 +1255,17 @@ static const struct vm_operations_struct cif_isp10_vm_ops = {
 
 int cif_isp10_v4l2_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct videobuf_queue *queue = to_videobuf_queue(file);
-	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
-	enum cif_isp10_stream_id strm = to_stream_id(file);
+	struct vb2_queue *queue;
+	struct cif_isp10_device *dev;
+	enum cif_isp10_stream_id strm;
 	int retval;
 
+	if (!cifisp10_meta_mmap)
+		return vb2_fop_mmap(file, vma);
+
+	queue = to_vb2_queue(file);
+	dev = to_cif_isp10_device(queue);
+	strm = to_stream_id(file);
 	retval = cif_isp10_mmap(dev, strm, vma);
 	if (retval < 0)
 		goto done;
@@ -1093,8 +1294,7 @@ const struct v4l2_file_operations cif_isp10_v4l2_fops = {
 static int v4l2_querycap(struct file *file,
 			 void *priv, struct v4l2_capability *cap)
 {
-	int ret = 0;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct video_device *vdev = video_devdata(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	u32 stream_ids = to_stream_id(file);
@@ -1105,20 +1305,23 @@ static int v4l2_querycap(struct file *file,
 		"platform:" DRIVER_NAME "-%03i",
 		dev->dev_id);
 
-	if (stream_ids == CIF_ISP10_STREAM_SP)
-		cap->capabilities = V4L2_CAP_VIDEO_OVERLAY |
-			V4L2_CAP_VIDEO_CAPTURE_MPLANE |
-			V4L2_CAP_STREAMING;
-	else if (stream_ids == CIF_ISP10_STREAM_MP)
+	if (stream_ids == CIF_ISP10_STREAM_SP) {
 		cap->capabilities = V4L2_CAP_VIDEO_CAPTURE |
-			V4L2_CAP_VIDEO_CAPTURE_MPLANE |
 			V4L2_CAP_STREAMING;
+		cap->device_caps |= V4L2_CAP_VIDEO_CAPTURE |
+			V4L2_CAP_STREAMING;
+	} else if (stream_ids == CIF_ISP10_STREAM_MP) {
+		cap->capabilities = V4L2_CAP_VIDEO_CAPTURE |
+			V4L2_CAP_STREAMING;
+		cap->device_caps |= V4L2_CAP_VIDEO_CAPTURE |
+			V4L2_CAP_STREAMING;
+	}
 	else if (stream_ids == CIF_ISP10_STREAM_DMA)
 		cap->capabilities = V4L2_CAP_VIDEO_M2M_MPLANE |
 			V4L2_CAP_VIDEO_M2M;
 	cap->capabilities |= V4L2_CAP_DEVICE_CAPS;
-	cap->device_caps = V4L2_CAP_DEVICE_CAPS;
-	return ret;
+	cap->device_caps |= V4L2_CAP_DEVICE_CAPS;
+	return 0;
 }
 
 static int cif_isp10_v4l2_subscribe_event(struct v4l2_fh *fh,
@@ -1153,8 +1356,9 @@ static void cif_isp10_v4l2_requeue_bufs(
 	struct cif_isp10_device *dev,
 	enum cif_isp10_stream_id stream_id)
 {
-	struct videobuf_buffer *buf;
-	struct videobuf_queue *q = NULL;
+	struct cif_isp10_buffer *ispbuf;
+	struct vb2_buffer *buf;
+	struct vb2_queue *q = NULL;
 	struct cif_isp10_v4l2_device *cif_isp10_v4l2_dev =
 		(struct cif_isp10_v4l2_device *)dev->nodes;
 
@@ -1169,22 +1373,28 @@ static void cif_isp10_v4l2_requeue_bufs(
 
 	dev = to_cif_isp10_device(q);
 
-	list_for_each_entry(buf, &q->stream, stream) {
+	list_for_each_entry(buf, &q->queued_list, queued_entry) {
+		if (buf->state == VB2_BUF_STATE_DONE)
+			continue;
+
+		ispbuf = to_cif_isp10_vb(to_vb2_v4l2_buffer(buf));
 		if (!IS_ERR_VALUE(cif_isp10_qbuf(
-			to_cif_isp10_device(q), stream_id, buf))) {
+			to_cif_isp10_device(q), stream_id, ispbuf))) {
 			spin_lock(&dev->vbreq_lock);
-			if ((buf->state == VIDEOBUF_QUEUED) ||
-			    (buf->state == VIDEOBUF_ACTIVE) ||
-			    (buf->state == VIDEOBUF_DONE))
-				buf->state = VIDEOBUF_QUEUED;
-			else
+			if (buf->state == VB2_BUF_STATE_QUEUED) {
+				buf->state = VB2_BUF_STATE_ACTIVE;
+				atomic_inc(&q->owned_by_drv_count);
+			} else if (buf->state == VB2_BUF_STATE_ACTIVE) {
+				/* nothing */
+			} else {
 				cif_isp10_pltfrm_pr_err(NULL,
-					"ERR: buf->state is: %d\n",
-					buf->state);
+					"skip state change for buf: %d, state: %d\n",
+					buf->index, buf->state);
+			}
 			spin_unlock(&dev->vbreq_lock);
 		} else {
 			cif_isp10_pltfrm_pr_err(NULL,
-				"failed for buffer %d\n", buf->i);
+				"failed for buffer %d\n", buf->index);
 		}
 	}
 }
@@ -1193,13 +1403,17 @@ static long v4l2_default_ioctl(struct file *file, void *fh,
 			       bool valid_prio, unsigned int cmd, void *arg)
 {
 	int ret = -EINVAL;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	u32 h_offs;
+	u32 v_offs;
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 
+	mutex_lock(&dev->api_mutex);
 	if (!arg) {
 		cif_isp10_pltfrm_pr_err(dev->dev,
 			"NULL Pointer Violation from IOCTL arg:0x%lx\n",
 			(unsigned long)arg);
+		mutex_unlock(&dev->api_mutex);
 		return ret;
 	}
 
@@ -1213,6 +1427,7 @@ static long v4l2_default_ioctl(struct file *file, void *fh,
 		if (ret < 0) {
 			cif_isp10_pltfrm_pr_err(dev->dev,
 				"failed to get sensor mode data\n");
+			mutex_unlock(&dev->api_mutex);
 			return ret;
 		}
 
@@ -1229,11 +1444,19 @@ static long v4l2_default_ioctl(struct file *file, void *fh,
 			dev->config.isp_config.output.width;
 		p_mode_data->isp_output_height =
 			dev->config.isp_config.output.height;
-
-		if (ret < 0) {
-			cif_isp10_pltfrm_pr_err(dev->dev,
-				"failed to get isp input info\n");
-			return ret;
+		if (p_mode_data->isp_output_width == 0 ||
+		    p_mode_data->isp_output_height == 0) {
+			ret = cif_isp10_calc_isp_cropping(dev,
+				&p_mode_data->isp_output_width,
+				&p_mode_data->isp_output_height,
+				&h_offs,
+				&v_offs);
+			if (IS_ERR_VALUE(ret)) {
+				cif_isp10_pltfrm_pr_err(dev->dev,
+					"failed to get isp_output data\n");
+				mutex_unlock(&dev->api_mutex);
+				return ret;
+			}
 		}
 	} else if (cmd == RK_VIDIOC_CAMERA_MODULEINFO) {
 		struct camera_module_info_s *p_camera_module =
@@ -1245,11 +1468,47 @@ static long v4l2_default_ioctl(struct file *file, void *fh,
 		if (ret < 0) {
 			cif_isp10_pltfrm_pr_err(dev->dev,
 				"failed to get camera module information\n");
+			mutex_unlock(&dev->api_mutex);
+			return ret;
+		}
+	} else if (cmd == RK_VIDIOC_SENSOR_CONFIGINFO) {
+		struct sensor_config_info_s *p_sensor_config =
+		(struct sensor_config_info_s *)arg;
+
+		ret = (int)cif_isp10_img_src_ioctl(dev->img_src,
+			RK_VIDIOC_SENSOR_CONFIGINFO, p_sensor_config);
+
+		if (ret < 0) {
+			cif_isp10_pltfrm_pr_err(dev->dev,
+				"failed to get camera module information\n");
+			mutex_unlock(&dev->api_mutex);
+			return ret;
+		}
+	} else if (cmd == RK_VIDIOC_SENSOR_REG_ACCESS) {
+		struct sensor_reg_rw_s *p_sensor_rw =
+		(struct sensor_reg_rw_s *)arg;
+
+		ret = (int)cif_isp10_img_src_ioctl(dev->img_src,
+			RK_VIDIOC_SENSOR_REG_ACCESS, p_sensor_rw);
+
+		 if (ret < 0) {
+			cif_isp10_pltfrm_pr_err(dev->dev,
+				"failed to get camera module information\n");
+			mutex_unlock(&dev->api_mutex);
 			return ret;
 		}
 	}
 
+	mutex_unlock(&dev->api_mutex);
 	return ret;
+}
+
+static int v4l2_g_parm(
+		struct file *file,
+		void *priv,
+		struct v4l2_streamparm *a)
+{
+	return 0;
 }
 
 static int v4l2_s_parm(
@@ -1263,25 +1522,30 @@ static int v4l2_s_parm(
 static int v4l2_enum_input(struct file *file, void *priv,
 			   struct v4l2_input *input)
 {
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	const char *inp_name;
 
+	mutex_lock(&dev->api_mutex);
 	if ((queue->type != V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
 		(queue->type != V4L2_BUF_TYPE_VIDEO_OVERLAY)) {
 		cif_isp10_pltfrm_pr_err(NULL,
 			"wrong buffer queue %d\n", queue->type);
+		mutex_unlock(&dev->api_mutex);
 		return -EINVAL;
 	}
 
 	inp_name = cif_isp10_g_input_name(dev, input->index);
-	if (IS_ERR_OR_NULL(inp_name))
+	if (IS_ERR_OR_NULL(inp_name)) {
+		mutex_unlock(&dev->api_mutex);
 		return -EINVAL;
+	}
 
 	input->type = V4L2_INPUT_TYPE_CAMERA;
 	input->std = V4L2_STD_UNKNOWN;
 	strncpy(input->name, inp_name, sizeof(input->name)-1);
 
+	mutex_unlock(&dev->api_mutex);
 	return 0;
 }
 
@@ -1357,11 +1621,15 @@ static int v4l2_enum_fmt_cap(struct file *file, void *fh,
 {
 	int ret = 0;
 	int xgold_num_format = 0;
+	struct vb2_queue *queue = to_vb2_queue(file);
+	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 
+	mutex_lock(&dev->api_mutex);
 	xgold_num_format = get_cif_isp10_output_format_desc_size();
 	if ((f->index >= xgold_num_format) ||
 	(get_cif_isp10_output_format_desc(f->index)->pixelformat == 0)) {
 		cif_isp10_pltfrm_pr_err(NULL, "index %d\n", f->index);
+		mutex_unlock(&dev->api_mutex);
 		return -EINVAL;
 	}
 	strlcpy(f->description,
@@ -1371,30 +1639,49 @@ static int v4l2_enum_fmt_cap(struct file *file, void *fh,
 	get_cif_isp10_output_format_desc(f->index)->pixelformat;
 	f->flags = get_cif_isp10_output_format_desc(f->index)->flags;
 
+	mutex_unlock(&dev->api_mutex);
+
 	return ret;
 }
 
 static int v4l2_g_ctrl(struct file *file, void *priv,
 	struct v4l2_control *vc)
 {
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	enum cif_isp10_cid id =
 		cif_isp10_v4l2_cid2cif_isp10_cid(vc->id);
+	int ret;
 
-	return cif_isp10_img_src_g_ctrl(dev->img_src,
-		id, &vc->value);
+	mutex_lock(&dev->api_mutex);
+	if (id == CIF_ISP10_CID_MIN_BUFFER_FOR_CAPTURE) {
+		/* Three buffers needed at least.
+		 * one for MI_MP_Y_BASE_AD_INIT, one for MI_MP_Y_BASE_AD_SHD
+		 * the other one stay in the waiting queue.
+		 */
+		vc->value = 3;
+		cif_isp10_pltfrm_pr_dbg(dev->dev,
+			"V4L2_CID_MIN_BUFFERS_FOR_CAPTURE %d\n",
+			vc->value);
+		mutex_unlock(&dev->api_mutex);
+		return 0;
+	}
+
+	ret = cif_isp10_img_src_g_ctrl(dev->img_src, id, &vc->value);
+	mutex_unlock(&dev->api_mutex);
+	return ret;
 }
 
 static int v4l2_s_ext_ctrls(struct file *file, void *priv,
 	struct v4l2_ext_controls *vc_ext)
 {
 	struct cif_isp10_img_src_ctrl *ctrls;
-	struct cif_isp10_img_src_ext_ctrl *ctrl;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+	struct cif_isp10_img_src_ext_ctrl ctrl;
 	int ret = -EINVAL;
-	unsigned int i;
+	unsigned int i, j;
+	bool cls_exp = false;
 
 	/* The only use-case is gain and exposure to sensor. Thus no check if
 	 * this shall go to img_src or not as of now.
@@ -1405,30 +1692,33 @@ static int v4l2_s_ext_ctrls(struct file *file, void *priv,
 	if (vc_ext->count == 0)
 		return ret;
 
-	ctrl = kmalloc(sizeof(*ctrl), GFP_KERNEL);
-	if (!ctrl)
-		return -ENOMEM;
-
 	ctrls = kmalloc(vc_ext->count *
 		sizeof(struct cif_isp10_img_src_ctrl), GFP_KERNEL);
-	if (!ctrls) {
-		kfree(ctrl);
+	if (!ctrls)
 		return -ENOMEM;
+
+	if (vc_ext->controls[0].id == RK_V4L2_CID_CLS_EXP) {
+		j = 1;
+		cls_exp = true;
+		ctrl.cnt = vc_ext->count - 1;
+	} else {
+		j = 0;
+		cls_exp = false;
+		ctrl.cnt = vc_ext->count;
 	}
 
-	ctrl->cnt = vc_ext->count;
 	/*current kernel version don't define
 	 *this member for struct v4l2_ext_control.
 	 */
-	/*ctrl->class = vc_ext->ctrl_class;*/
-	ctrl->ctrls = ctrls;
+	/*ctrl.class = vc_ext->ctrl_class;*/
+	ctrl.ctrls = ctrls;
 
-	for (i = 0; i < vc_ext->count; i++) {
-		ctrls[i].id = vc_ext->controls[i].id;
-		ctrls[i].val = vc_ext->controls[i].value;
+	for (i = 0; i < ctrl.cnt; i++, j++) {
+		ctrls[i].id = vc_ext->controls[j].id;
+		ctrls[i].val = vc_ext->controls[j].value;
 	}
 
-	ret = cif_isp10_s_exp(dev, ctrl);
+	ret = cif_isp10_s_exp(dev, &ctrl, cls_exp);
 	return ret;
 }
 
@@ -1438,11 +1728,12 @@ int cif_isp10_v4l2_cropcap(
 	struct v4l2_cropcap *a)
 {
 	int ret = 0;
-	struct videobuf_queue *queue = to_videobuf_queue(file);
+	struct vb2_queue *queue = to_vb2_queue(file);
 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
 	u32 target_width, target_height;
 	u32 h_offs, v_offs;
 
+	mutex_lock(&dev->api_mutex);
 	if ((dev->config.input_sel == CIF_ISP10_INP_DMA) ||
 		(dev->config.input_sel == CIF_ISP10_INP_DMA_IE)) {
 		/* calculate cropping for aspect ratio */
@@ -1456,6 +1747,7 @@ int cif_isp10_v4l2_cropcap(
 		if (ret < 0) {
 			cif_isp10_pltfrm_pr_err(dev->dev,
 				"failed to get target frame size\n");
+			mutex_unlock(&dev->api_mutex);
 			return ret;
 		}
 
@@ -1492,6 +1784,7 @@ int cif_isp10_v4l2_cropcap(
 		if (ret < 0) {
 			cif_isp10_pltfrm_pr_err(dev->dev,
 				"failed to get target frame size\n");
+			mutex_unlock(&dev->api_mutex);
 			return ret;
 		}
 
@@ -1524,6 +1817,7 @@ int cif_isp10_v4l2_cropcap(
 		a->bounds.left,
 		a->bounds.top);
 
+	mutex_unlock(&dev->api_mutex);
 	return ret;
 }
 
@@ -1546,20 +1840,35 @@ int cif_isp10_v4l2_s_crop(
 	return 0;
 }
 
+int cif_isp10_v4l2_try_fmt(struct file *file, void *fh,
+					struct v4l2_format *f)
+{
+	return 0;
+}
+
 const struct v4l2_ioctl_ops cif_isp10_v4l2_sp_ioctlops = {
 	.vidioc_reqbufs = cif_isp10_v4l2_reqbufs,
 	.vidioc_querybuf = cif_isp10_v4l2_querybuf,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
 	.vidioc_qbuf = cif_isp10_v4l2_qbuf,
 	.vidioc_dqbuf = cif_isp10_v4l2_dqbuf,
 	.vidioc_streamon = cif_isp10_v4l2_streamon,
 	.vidioc_streamoff = cif_isp10_v4l2_streamoff,
+	.vidioc_g_input = cif_isp10_v4l2_g_input,
 	.vidioc_s_input = cif_isp10_v4l2_s_input,
 	.vidioc_enum_input = v4l2_enum_input,
 	.vidioc_g_ctrl = v4l2_g_ctrl,
 	.vidioc_s_ctrl = cif_isp10_v4l2_s_ctrl,
+	.vidioc_s_fmt_vid_cap = cif_isp10_v4l2_s_fmt,
+	.vidioc_g_fmt_vid_cap = cif_isp10_v4l2_g_fmt,
+	.vidioc_s_fmt_vid_cap_mplane = cif_isp10_v4l2_s_fmt,
+	.vidioc_g_fmt_vid_cap_mplane = cif_isp10_v4l2_g_fmt,
 	.vidioc_s_fmt_vid_overlay = cif_isp10_v4l2_s_fmt,
 	.vidioc_g_fmt_vid_overlay = cif_isp10_v4l2_g_fmt,
 	.vidioc_s_ext_ctrls = v4l2_s_ext_ctrls,
+	.vidioc_enum_fmt_vid_cap = v4l2_enum_fmt_cap,
+	.vidioc_enum_framesizes = cif_isp10_v4l2_enum_framesizes,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
 	.vidioc_querycap = v4l2_querycap,
 	.vidioc_cropcap = cif_isp10_v4l2_cropcap,
 	.vidioc_s_crop = cif_isp10_v4l2_s_crop,
@@ -1567,6 +1876,9 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_sp_ioctlops = {
 	.vidioc_subscribe_event = cif_isp10_v4l2_subscribe_event,
 	.vidioc_unsubscribe_event = cif_isp10_v4l2_unsubscribe_event,
 	.vidioc_default = v4l2_default_ioctl,
+	.vidioc_try_fmt_vid_cap = cif_isp10_v4l2_try_fmt,
+	.vidioc_s_parm = v4l2_s_parm,
+	.vidioc_g_parm = v4l2_g_parm,
 };
 
 const struct v4l2_ioctl_ops cif_isp10_v4l2_mp_ioctlops = {
@@ -1576,20 +1888,25 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_mp_ioctlops = {
 	.vidioc_dqbuf = cif_isp10_v4l2_dqbuf,
 	.vidioc_streamon = cif_isp10_v4l2_streamon,
 	.vidioc_streamoff = cif_isp10_v4l2_streamoff,
+	.vidioc_g_input = cif_isp10_v4l2_g_input,
 	.vidioc_s_input = cif_isp10_v4l2_s_input,
 	.vidioc_enum_input = v4l2_enum_input,
 	.vidioc_g_ctrl = mainpath_g_ctrl,
 	.vidioc_s_ctrl = cif_isp10_v4l2_s_ctrl,
 	.vidioc_s_fmt_vid_cap = cif_isp10_v4l2_s_fmt,
 	.vidioc_g_fmt_vid_cap = cif_isp10_v4l2_g_fmt,
+	.vidioc_s_ext_ctrls = v4l2_s_ext_ctrls,
 	.vidioc_enum_fmt_vid_cap = v4l2_enum_fmt_cap,
 	.vidioc_enum_framesizes = cif_isp10_v4l2_enum_framesizes,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
 	.vidioc_s_parm = v4l2_s_parm,
 	.vidioc_querycap = v4l2_querycap,
 	.vidioc_cropcap = cif_isp10_v4l2_cropcap,
 	.vidioc_s_crop = cif_isp10_v4l2_s_crop,
 	.vidioc_g_crop = cif_isp10_v4l2_g_crop,
 	.vidioc_default = v4l2_default_ioctl,
+	.vidioc_try_fmt_vid_cap = cif_isp10_v4l2_try_fmt,
+	.vidioc_g_parm = v4l2_g_parm,
 };
 
 const struct v4l2_ioctl_ops cif_isp10_v4l2_dma_ioctlops = {
@@ -1604,6 +1921,7 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_dma_ioctlops = {
 	.vidioc_cropcap = cif_isp10_v4l2_cropcap,
 	.vidioc_s_crop = cif_isp10_v4l2_s_crop,
 	.vidioc_g_crop = cif_isp10_v4l2_g_crop,
+	.vidioc_querycap = v4l2_querycap,
 };
 
 static struct pltfrm_soc_cfg rk3288_cfg = {
@@ -1624,7 +1942,8 @@ static const struct of_device_id cif_isp10_v4l2_of_match[] = {
 	{},
 };
 
-static unsigned int cif_isp10_v4l2_dev_cnt;
+static unsigned int g_cif_isp10_v4l2_dev_cnt;
+static struct cif_isp10_v4l2_device *g_cif_isp10_v4l2_dev[4];
 static int cif_isp10_v4l2_drv_probe(struct platform_device *pdev)
 {
 	const struct of_device_id *match;
@@ -1633,7 +1952,10 @@ static int cif_isp10_v4l2_drv_probe(struct platform_device *pdev)
 	struct cif_isp10_v4l2_device *cif_isp10_v4l2_dev;
 	int ret;
 
-	cif_isp10_pltfrm_pr_info(NULL, "probing...\n");
+	cif_isp10_pltfrm_pr_info(NULL, "CIF ISP10 driver version: v%x.%x.%x\n",
+		CONFIG_CIFISP10_DRIVER_VERSION >> 16,
+		(CONFIG_CIFISP10_DRIVER_VERSION & 0xff00) >> 8,
+		CONFIG_CIFISP10_DRIVER_VERSION & 0x00ff);
 
 	cif_isp10_v4l2_dev = devm_kzalloc(
 				&pdev->dev,
@@ -1654,12 +1976,16 @@ static int cif_isp10_v4l2_drv_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-	dev->dev_id = cif_isp10_v4l2_dev_cnt;
+	dev->dev_id = g_cif_isp10_v4l2_dev_cnt;
 	dev->isp_dev.dev_id = &dev->dev_id;
 	dev->nodes = (void *)cif_isp10_v4l2_dev;
+	dev->isp_state = CIF_ISP10_STATE_IDLE;
 	spin_lock_init(&dev->vbq_lock);
 	spin_lock_init(&dev->vbreq_lock);
-	spin_lock_init(&iowrite32_verify_lock);
+	spin_lock_init(&dev->iowrite32_verify_lock);
+	spin_lock_init(&dev->isp_state_lock);
+	init_waitqueue_head(&dev->isp_stop_wait);
+	mutex_init(&dev->api_mutex);
 
 	ret = v4l2_device_register(dev->dev, &dev->v4l2_dev);
 	if (IS_ERR_VALUE(ret)) {
@@ -1708,9 +2034,14 @@ static int cif_isp10_v4l2_drv_probe(struct platform_device *pdev)
 	if (ret)
 		goto err;
 
+	cif_isp10_v4l2_register_imgsrc_subdev(
+		dev);
+
 	pm_runtime_enable(&pdev->dev);
 
-	cif_isp10_v4l2_dev_cnt++;
+	g_cif_isp10_v4l2_dev[g_cif_isp10_v4l2_dev_cnt] =
+		cif_isp10_v4l2_dev;
+	g_cif_isp10_v4l2_dev_cnt++;
 	return 0;
 err:
 	cif_isp10_destroy(dev);
@@ -1736,10 +2067,11 @@ static int cif_isp10_v4l2_drv_remove(struct platform_device *pdev)
 	video_unregister_device(&cif_isp10_v4l2_dev->node[DMA_DEV].vdev);
 	unregister_cifisp_device(&cif_isp10_v4l2_dev->node[ISP_DEV].vdev);
 	v4l2_device_unregister(&cif_isp10_dev->v4l2_dev);
-	cif_isp10_pltfrm_dev_release(&pdev->dev);
+	cif_isp10_pltfrm_dev_release(&pdev->dev, cif_isp10_dev);
 	cif_isp10_destroy(cif_isp10_dev);
 
-	cif_isp10_v4l2_dev_cnt--;
+	g_cif_isp10_v4l2_dev_cnt--;
+	g_cif_isp10_v4l2_dev[g_cif_isp10_v4l2_dev_cnt] = NULL;
 	return 0;
 }
 
@@ -1829,6 +2161,7 @@ static int cif_isp10_v4l2_init(void)
 {
 	int ret;
 
+	g_cif_isp10_v4l2_dev_cnt = 0;
 	ret = platform_driver_register(&cif_isp10_v4l2_plat_drv);
 	if (ret) {
 		cif_isp10_pltfrm_pr_err(NULL,
@@ -1844,6 +2177,74 @@ static int cif_isp10_v4l2_init(void)
 static void __exit cif_isp10_v4l2_exit(void)
 {
 	platform_driver_unregister(&cif_isp10_v4l2_plat_drv);
+}
+
+/* ======================================================================== */
+void cif_isp10_v4l2_s_frame_interval(
+	unsigned int numerator,
+	unsigned int denominator)
+{
+	struct cif_isp10_v4l2_device *cif_isp10_v4l2_dev;
+	struct cif_isp10_device *cif_isp10_dev;
+	struct vb2_queue *queue;
+	struct cif_isp10_frm_intrvl frm_intrvl;
+	unsigned int i;
+
+	for (i = 0; i < g_cif_isp10_v4l2_dev_cnt; i++) {
+		if (g_cif_isp10_v4l2_dev[i] == NULL)
+			continue;
+
+		cif_isp10_v4l2_dev =
+			g_cif_isp10_v4l2_dev[i];
+		queue = (struct vb2_queue *)
+			&cif_isp10_v4l2_dev->node[SP_DEV].buf_queue;
+		cif_isp10_dev = to_cif_isp10_device(queue);
+
+		if (cif_isp10_dev->img_src == NULL)
+			continue;
+
+		frm_intrvl.numerator = numerator;
+		frm_intrvl.denominator = denominator;
+		cif_isp10_img_src_s_frame_interval(
+			cif_isp10_dev->img_src,
+			&frm_intrvl);
+	}
+}
+
+int cif_isp10_v4l2_g_frame_interval(
+	unsigned int *numerator,
+	unsigned int *denominator)
+{
+	struct cif_isp10_v4l2_device *cif_isp10_v4l2_dev;
+	struct cif_isp10_device *cif_isp10_dev;
+	struct vb2_queue *queue;
+	struct cif_isp10_frm_intrvl frm_intrvl;
+	unsigned int i;
+	int ret = -EFAULT;
+
+	for (i = 0; i < g_cif_isp10_v4l2_dev_cnt; i++) {
+		if (g_cif_isp10_v4l2_dev[i] == NULL)
+			continue;
+
+		cif_isp10_v4l2_dev =
+			g_cif_isp10_v4l2_dev[i];
+		queue = (struct vb2_queue *)
+			&cif_isp10_v4l2_dev->node[SP_DEV].buf_queue;
+		cif_isp10_dev = to_cif_isp10_device(queue);
+
+		if (cif_isp10_dev->img_src == NULL)
+			continue;
+
+		ret = cif_isp10_img_src_g_frame_interval(
+			cif_isp10_dev->img_src,
+			&frm_intrvl);
+		if (ret == 0) {
+			*numerator = frm_intrvl.numerator;
+			*denominator = frm_intrvl.denominator;
+		}
+	}
+
+	return ret;
 }
 
 device_initcall_sync(cif_isp10_v4l2_init);

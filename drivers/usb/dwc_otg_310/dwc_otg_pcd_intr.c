@@ -284,7 +284,7 @@ void start_next_request(dwc_otg_pcd_ep_t *ep)
 #endif
 		dwc_otg_ep_start_transfer(GET_CORE_IF(ep->pcd), &ep->dwc_ep);
 	} else if (ep->dwc_ep.type == DWC_OTG_EP_TYPE_ISOC) {
-		DWC_PRINTF("There are no more ISOC requests \n");
+		DWC_DEBUGPL(DBG_PCD, "There are no more ISOC requests\n");
 		ep->dwc_ep.frame_num = 0xFFFFFFFF;
 	}
 }
@@ -792,13 +792,8 @@ static inline void ep0_out_start(dwc_otg_core_if_t *core_if,
 	/** DOEPCTL0 Register write cnak will be set after setup interrupt */
 	doepctl.d32 = 0;
 	doepctl.b.epena = 1;
-	if (core_if->snpsid <= OTG_CORE_REV_2_94a) {
-		doepctl.b.cnak = 1;
-		DWC_WRITE_REG32(&dev_if->out_ep_regs[0]->doepctl, doepctl.d32);
-	} else {
-		DWC_MODIFY_REG32(&dev_if->out_ep_regs[0]->doepctl, 0,
-				 doepctl.d32);
-	}
+	DWC_MODIFY_REG32(&dev_if->out_ep_regs[0]->doepctl, 0,
+			 doepctl.d32);
 
 #ifdef VERBOSE
 	DWC_DEBUGPL(DBG_PCDV, "doepctl0=%0x\n",
@@ -2409,7 +2404,8 @@ static void complete_ep(dwc_otg_pcd_ep_t *ep)
 				/*      Check if the whole transfer was completed,
 				 *      if no, setup transfer for next portion of data
 				 */
-				if (ep->dwc_ep.xfer_len < ep->dwc_ep.total_len) {
+				if (ep->dwc_ep.xfer_len < ep->dwc_ep.total_len &&
+				    deptsiz.b.xfersize == 0) {
 					dwc_otg_ep_start_transfer(core_if,
 								  &ep->dwc_ep);
 				} else if (ep->dwc_ep.sent_zlp) {
@@ -4610,27 +4606,9 @@ retry:
 									ep->dwc_ep.stp_rollover = 0;
 									/* Prepare for more setup packets */
 									if (pcd->ep0state == EP0_IN_STATUS_PHASE || pcd->ep0state == EP0_IN_DATA_PHASE) {
-										depctl_data_t
-										    depctl
-										    = {
-										.d32 = 0};
-										depctl.b.cnak
-										    =
-										    1;
 										ep0_out_start
 										    (core_if,
 										     pcd);
-										/* Core not updating setup packet count
-										 * in case of PET testing - @TODO vahrama
-										 * to check with HW team further */
-										if (!core_if->otg_ver) {
-											DWC_MODIFY_REG32
-											    (&core_if->dev_if->
-											     out_ep_regs
-											     [0]->doepctl,
-											     0,
-											     depctl.d32);
-										}
 									}
 									goto exit_xfercompl;
 								} else {
@@ -4800,27 +4778,9 @@ retry:
 										    (pcd);
 										/* Prepare for setup packets if ep0in was enabled */
 										if (pcd->ep0state == EP0_IN_STATUS_PHASE) {
-											depctl_data_t
-											    depctl
-											    = {
-											.d32 = 0};
-											depctl.b.cnak
-											    =
-											    1;
 											ep0_out_start
 											    (core_if,
 											     pcd);
-											/* Core not updating setup packet count
-											 * in case of PET testing - @TODO vahrama
-											 * to check with HW team further */
-											if (!core_if->otg_ver) {
-												DWC_MODIFY_REG32
-												    (&core_if->dev_if->
-												     out_ep_regs
-												     [0]->doepctl,
-												     0,
-												     depctl.d32);
-											}
 										}
 										goto exit_xfercompl;
 									} else {
@@ -4913,12 +4873,10 @@ exit_xfercompl:
 				deptsiz.d32 =
 				    DWC_READ_REG32(&core_if->dev_if->
 						   out_ep_regs[0]->doeptsiz);
-				if ((core_if->dma_desc_enable)
-				    || (core_if->dma_enable
-					&& core_if->snpsid >=
-					OTG_CORE_REV_3_00a)) {
+				if (core_if->dma_desc_enable) {
 					do_setup_in_status_phase(pcd);
 				}
+
 			}
 
 			/* Endpoint disable      */

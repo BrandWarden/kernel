@@ -17,6 +17,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/clk.h>
 
@@ -26,6 +27,7 @@
 #include <drm/drm_of.h>
 #include <drm/drm_panel.h>
 
+#include <uapi/linux/videodev2.h>
 #include <video/of_videomode.h>
 #include <video/videomode.h>
 
@@ -59,9 +61,12 @@ struct rockchip_dp_device {
 	struct clk               *pclk;
 	struct regmap            *grf;
 	struct reset_control     *rst;
+	struct regulator         *vcc_supply;
+	struct regulator         *vccio_supply;
 
 	const struct rockchip_dp_chip_data *data;
 
+	struct analogix_dp_device *adp;
 	struct analogix_dp_plat_data plat_data;
 };
 
@@ -79,11 +84,19 @@ static int rockchip_dp_poweron(struct analogix_dp_plat_data *plat_data)
 	struct rockchip_dp_device *dp = to_dp(plat_data);
 	int ret;
 
-	ret = clk_prepare_enable(dp->pclk);
-	if (ret < 0) {
-		dev_err(dp->dev, "failed to enable pclk %d\n", ret);
-		return ret;
+	if (dp->vcc_supply) {
+		ret = regulator_enable(dp->vcc_supply);
+		if (ret)
+			dev_warn(dp->dev, "failed to enable vcc: %d\n", ret);
 	}
+
+	if (dp->vccio_supply) {
+		ret = regulator_enable(dp->vccio_supply);
+		if (ret)
+			dev_warn(dp->dev, "failed to enable vccio: %d\n", ret);
+	}
+
+	clk_prepare_enable(dp->pclk);
 
 	ret = rockchip_dp_pre_init(dp);
 	if (ret < 0) {
@@ -99,6 +112,12 @@ static int rockchip_dp_powerdown(struct analogix_dp_plat_data *plat_data)
 	struct rockchip_dp_device *dp = to_dp(plat_data);
 
 	clk_disable_unprepare(dp->pclk);
+
+	if (dp->vccio_supply)
+		regulator_disable(dp->vccio_supply);
+
+	if (dp->vcc_supply)
+		regulator_disable(dp->vcc_supply);
 
 	return 0;
 }
@@ -187,6 +206,46 @@ rockchip_dp_drm_encoder_atomic_check(struct drm_encoder *encoder,
 	s->output_type = DRM_MODE_CONNECTOR_eDP;
 	if (info->num_bus_formats)
 		s->bus_format = info->bus_formats[0];
+	else
+		s->bus_format = MEDIA_BUS_FMT_RGB888_1X24;
+	s->tv_state = &conn_state->tv;
+	s->eotf = TRADITIONAL_GAMMA_SDR;
+	s->color_space = V4L2_COLORSPACE_DEFAULT;
+
+	return 0;
+}
+
+static int rockchip_dp_drm_encoder_loader_protect(struct drm_encoder *encoder,
+						  bool on)
+{
+	struct rockchip_dp_device *dp = to_dp(encoder);
+	int ret;
+
+	if (on) {
+		if (dp->vcc_supply) {
+			ret = regulator_enable(dp->vcc_supply);
+			if (ret)
+				dev_warn(dp->dev,
+					 "failed to enable vcc: %d\n", ret);
+		}
+
+		if (dp->vccio_supply) {
+			ret = regulator_enable(dp->vccio_supply);
+			if (ret)
+				dev_warn(dp->dev,
+					 "failed to enable vccio: %d\n", ret);
+		}
+
+		clk_prepare_enable(dp->pclk);
+	} else {
+		clk_disable_unprepare(dp->pclk);
+
+		if (dp->vccio_supply)
+			regulator_disable(dp->vccio_supply);
+
+		if (dp->vcc_supply)
+			regulator_disable(dp->vcc_supply);
+	}
 
 	return 0;
 }
@@ -197,6 +256,7 @@ static struct drm_encoder_helper_funcs rockchip_dp_encoder_helper_funcs = {
 	.enable = rockchip_dp_drm_encoder_enable,
 	.disable = rockchip_dp_drm_encoder_nop,
 	.atomic_check = rockchip_dp_drm_encoder_atomic_check,
+	.loader_protect = rockchip_dp_drm_encoder_loader_protect,
 };
 
 static void rockchip_dp_drm_encoder_destroy(struct drm_encoder *encoder)
@@ -232,10 +292,27 @@ static int rockchip_dp_init(struct rockchip_dp_device *dp)
 		return PTR_ERR(dp->rst);
 	}
 
-	ret = clk_prepare_enable(dp->pclk);
-	if (ret < 0) {
-		dev_err(dp->dev, "failed to enable pclk %d\n", ret);
-		return ret;
+	dp->vcc_supply = devm_regulator_get_optional(dev, "vcc");
+	if (IS_ERR(dp->vcc_supply)) {
+		if (PTR_ERR(dp->vcc_supply) != -ENODEV) {
+			ret = PTR_ERR(dp->vcc_supply);
+			dev_err(dev, "failed to get vcc regulator: %d\n", ret);
+			return ret;
+		}
+
+		dp->vcc_supply = NULL;
+	}
+
+	dp->vccio_supply = devm_regulator_get_optional(dev, "vccio");
+	if (IS_ERR(dp->vccio_supply)) {
+		if (PTR_ERR(dp->vccio_supply) != -ENODEV) {
+			ret = PTR_ERR(dp->vccio_supply);
+			dev_err(dev, "failed to get vccio regulator: %d\n",
+				ret);
+			return ret;
+		}
+
+		dp->vccio_supply = NULL;
 	}
 
 	return 0;
@@ -300,12 +377,6 @@ static int rockchip_dp_bind(struct device *dev, struct device *master,
 	}
 
 	dp->plat_data.panel = panel;
-	/*
-	 * Just like the probe function said, we don't need the
-	 * device drvrate anymore, we should leave the charge to
-	 * analogix dp driver, set the device drvdata to NULL.
-	 */
-	dev_set_drvdata(dev, NULL);
 
 	dp_data = of_device_get_match_data(dev);
 	if (!dp_data)
@@ -332,13 +403,19 @@ static int rockchip_dp_bind(struct device *dev, struct device *master,
 	dp->plat_data.power_off = rockchip_dp_powerdown;
 	dp->plat_data.get_modes = rockchip_dp_get_modes;
 
-	return analogix_dp_bind(dev, dp->drm_dev, &dp->plat_data);
+	dp->adp = analogix_dp_bind(dev, dp->drm_dev, &dp->plat_data);
+	if (IS_ERR(dp->adp))
+		return PTR_ERR(dp->adp);
+
+	return 0;
 }
 
 static void rockchip_dp_unbind(struct device *dev, struct device *master,
 			       void *data)
 {
-	return analogix_dp_unbind(dev, master, data);
+	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
+
+	analogix_dp_unbind(dp->adp);
 }
 
 static const struct component_ops rockchip_dp_component_ops = {
@@ -357,11 +434,6 @@ static int rockchip_dp_probe(struct platform_device *pdev)
 
 	dp->dev = dev;
 
-	/*
-	 * We just use the drvdata until driver run into component
-	 * add function, and then we would set drvdata to null, so
-	 * that analogix dp driver could take charge of the drvdata.
-	 */
 	platform_set_drvdata(pdev, dp);
 
 	return component_add(dev, &rockchip_dp_component_ops);
@@ -374,10 +446,26 @@ static int rockchip_dp_remove(struct platform_device *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_PM_SLEEP
+static int rockchip_dp_suspend(struct device *dev)
+{
+	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
+
+	return analogix_dp_suspend(dp->adp);
+}
+
+static int rockchip_dp_resume(struct device *dev)
+{
+	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
+
+	return analogix_dp_resume(dp->adp);
+}
+#endif
+
 static const struct dev_pm_ops rockchip_dp_pm_ops = {
 #ifdef CONFIG_PM_SLEEP
-	.suspend = analogix_dp_suspend,
-	.resume_early = analogix_dp_resume,
+	.suspend = rockchip_dp_suspend,
+	.resume_early = rockchip_dp_resume,
 #endif
 };
 

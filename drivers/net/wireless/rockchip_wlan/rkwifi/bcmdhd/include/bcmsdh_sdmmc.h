@@ -1,7 +1,7 @@
 /*
  * BCMSDH Function Driver for the native SDIO/MMC driver in the Linux Kernel
  *
- * Copyright (C) 1999-2016, Broadcom Corporation
+ * Copyright (C) 1999-2017, Broadcom Corporation
  * 
  *      Unless you and Broadcom execute a separate written software license
  * agreement governing use of this software, this software is licensed to you
@@ -24,7 +24,7 @@
  *
  * <<Broadcom-WL-IPTag/Proprietary,Open:>>
  *
- * $Id: bcmsdh_sdmmc.h 591160 2015-10-07 06:01:58Z $
+ * $Id: bcmsdh_sdmmc.h 687253 2017-02-28 09:33:36Z $
  */
 
 #ifndef __BCMSDH_SDMMC_H__
@@ -36,6 +36,7 @@
 #define sd_debug(x)	do { if (sd_msglevel & SDH_DEBUG_VAL) printf x; } while (0)
 #define sd_data(x)	do { if (sd_msglevel & SDH_DATA_VAL) printf x; } while (0)
 #define sd_ctrl(x)	do { if (sd_msglevel & SDH_CTRL_VAL) printf x; } while (0)
+#define sd_cost(x)	do { if (sd_msglevel & SDH_COST_VAL) printf x; } while (0)
 
 #define sd_sync_dma(sd, read, nbytes)
 #define sd_init_dma(sd)
@@ -59,15 +60,7 @@
 /* private bus modes */
 #define SDIOH_MODE_SD4		2
 #define CLIENT_INTR			0x100	/* Get rid of this! */
-#define SDIOH_SDMMC_MAX_SG_ENTRIES	32
-
-#if defined(SWTXGLOM)
-typedef struct glom_buf {
-	void *glom_pkt_head;
-	void *glom_pkt_tail;
-	uint32 count;				/* Total number of pkts queued */
-} glom_buf_t;
-#endif /* SWTXGLOM */
+#define SDIOH_SDMMC_MAX_SG_ENTRIES	(SDPCM_MAXGLOM_SIZE + 2)
 
 struct sdioh_info {
 	osl_t		*osh;			/* osh handler */
@@ -92,11 +85,8 @@ struct sdioh_info {
 	struct scatterlist	sg_list[SDIOH_SDMMC_MAX_SG_ENTRIES];
 	struct sdio_func	fake_func0;
 	struct sdio_func	*func[SDIOD_MAX_IOFUNCS];
-
+	uint		sd_clk_rate;
 	uint	txglom_mode;		/* Txglom mode: 0 - copy, 1 - multi-descriptor */
-#if defined(SWTXGLOM)
-	glom_buf_t glom_info;		/* pkt information used for glomming */
-#endif
 };
 
 /************************************************************

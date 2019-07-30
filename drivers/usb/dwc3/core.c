@@ -100,7 +100,10 @@ static int dwc3_core_soft_reset(struct dwc3 *dwc)
 	 * XHCI driver will reset the host block. If dwc3 was configured for
 	 * host-only mode, then we can return early.
 	 */
-	if (dwc->dr_mode == USB_DR_MODE_HOST)
+	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
+	if (dwc->dr_mode == USB_DR_MODE_HOST ||
+	    (dwc->dr_mode == USB_DR_MODE_OTG &&
+	    DWC3_GCTL_PRTCAP(reg) == DWC3_GCTL_PRTCAP_HOST))
 		return 0;
 
 	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
@@ -126,6 +129,17 @@ static int dwc3_soft_reset(struct dwc3 *dwc)
 {
 	unsigned long timeout;
 	u32 reg;
+
+	/*
+	 * We're resetting only the device side because, if we're in host mode,
+	 * XHCI driver will reset the host block. If dwc3 was configured for
+	 * host-only mode, then we can return early.
+	 */
+	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
+	if (dwc->dr_mode == USB_DR_MODE_HOST ||
+	    (dwc->dr_mode == USB_DR_MODE_OTG &&
+	    DWC3_GCTL_PRTCAP(reg) == DWC3_GCTL_PRTCAP_HOST))
+		return 0;
 
 	timeout = jiffies + msecs_to_jiffies(500);
 	dwc3_writel(dwc->regs, DWC3_DCTL, DWC3_DCTL_CSFTRST);
@@ -701,18 +715,47 @@ static int dwc3_core_init(struct dwc3 *dwc)
 		break;
 	}
 
+	reg = dwc3_readl(dwc->regs, DWC3_GUCTL1);
+
+	/*
+	 * Enable hardware control of sending remote wakeup in HS when
+	 * the device is in the L1 state.
+	 */
+	if (dwc->revision >= DWC3_REVISION_290A)
+		reg |= DWC3_GUCTL1_DEV_L1_EXIT_BY_HW;
+
+	if (dwc->tx_ipgap_linecheck_dis_quirk)
+		reg |= DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
+
+	dwc3_writel(dwc->regs, DWC3_GUCTL1, reg);
+
+	if (dwc->grxthrcfg[0] > 0) {
+		reg = dwc3_readl(dwc->regs, DWC3_GRXTHRCFG);
+		reg |= DWC3_GRXTHRCFG_PKTCNTSEL |
+		       DWC3_GRXTHRCFG_RXPKTCNT(dwc->grxthrcfg[0]) |
+		       DWC3_GRXTHRCFG_MAXRXBURSTSIZE(dwc->grxthrcfg[1]);
+		dwc3_writel(dwc->regs, DWC3_GRXTHRCFG, reg);
+	}
+
+	if (dwc->gtxthrcfg[0] > 0) {
+		reg = dwc3_readl(dwc->regs, DWC3_GTXTHRCFG);
+		reg |= DWC3_GTXTHRCFG_PKTCNTSEL |
+		       DWC3_GTXTHRCFG_TXPKTCNT(dwc->gtxthrcfg[0]) |
+		       DWC3_GTXTHRCFG_MAXRXBURSTSIZE(dwc->gtxthrcfg[1]);
+		dwc3_writel(dwc->regs, DWC3_GTXTHRCFG, reg);
+	}
+
 	return 0;
 
 err4:
-	phy_power_off(dwc->usb2_generic_phy);
+	phy_power_off(dwc->usb3_generic_phy);
 
 err3:
-	phy_power_off(dwc->usb3_generic_phy);
+	phy_power_off(dwc->usb2_generic_phy);
 
 err2:
 	usb_phy_set_suspend(dwc->usb2_phy, 1);
 	usb_phy_set_suspend(dwc->usb3_phy, 1);
-	dwc3_core_exit(dwc);
 
 err1:
 	usb_phy_shutdown(dwc->usb2_phy);
@@ -973,6 +1016,8 @@ static int dwc3_probe(struct platform_device *pdev)
 				"snps,dis_u3_susphy_quirk");
 	dwc->dis_u2_susphy_quirk = device_property_read_bool(dev,
 				"snps,dis_u2_susphy_quirk");
+	dwc->dis_u1u2_quirk = device_property_read_bool(dev,
+				"snps,dis-u1u2-quirk");
 	dwc->dis_enblslpm_quirk = device_property_read_bool(dev,
 				"snps,dis_enblslpm_quirk");
 	dwc->dis_rxdet_inp3_quirk = device_property_read_bool(dev,
@@ -981,8 +1026,14 @@ static int dwc3_probe(struct platform_device *pdev)
 				"snps,dis-u2-freeclk-exists-quirk");
 	dwc->dis_del_phy_power_chg_quirk = device_property_read_bool(dev,
 				"snps,dis-del-phy-power-chg-quirk");
+	dwc->tx_ipgap_linecheck_dis_quirk = device_property_read_bool(dev,
+				"snps,tx-ipgap-linecheck-dis-quirk");
 	dwc->xhci_slow_suspend_quirk = device_property_read_bool(dev,
 				"snps,xhci-slow-suspend-quirk");
+	dwc->xhci_trb_ent_quirk = device_property_read_bool(dev,
+				"snps,xhci-trb-ent-quirk");
+	dwc->usb3_warm_reset_on_resume_quirk = device_property_read_bool(dev,
+				"snps,usb3-warm-reset-on-resume-quirk");
 
 	dwc->tx_de_emphasis_quirk = device_property_read_bool(dev,
 				"snps,tx_de_emphasis_quirk");
@@ -992,6 +1043,11 @@ static int dwc3_probe(struct platform_device *pdev)
 				    &dwc->hsphy_interface);
 	device_property_read_u32(dev, "snps,quirk-frame-length-adjustment",
 				 &dwc->fladj);
+	device_property_read_u32_array(dev, "snps,gtx-threshold-cfg",
+				       dwc->gtxthrcfg, 2);
+
+	device_property_read_u32_array(dev, "snps,grx-threshold-cfg",
+				       dwc->grxthrcfg, 2);
 
 	/* default to superspeed if no maximum_speed passed */
 	if (dwc->maximum_speed == USB_SPEED_UNKNOWN)

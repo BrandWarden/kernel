@@ -129,6 +129,9 @@ struct cpufreq_interactive_tunables {
 
 /* For cases where we have single governor instance for system */
 static struct cpufreq_interactive_tunables *common_tunables;
+#ifdef CONFIG_ARCH_ROCKCHIP
+static struct cpufreq_interactive_tunables backup_tunables[2];
+#endif
 
 static struct attribute_group *get_sysfs_attr(void);
 
@@ -323,13 +326,13 @@ static u64 update_load(int cpu)
 		pcpu->policy->governor_data;
 	u64 now;
 	u64 now_idle;
-	unsigned int delta_idle;
-	unsigned int delta_time;
+	u64 delta_idle;
+	u64 delta_time;
 	u64 active_time;
 
 	now_idle = get_cpu_idle_time(cpu, &now, tunables->io_is_busy);
-	delta_idle = (unsigned int)(now_idle - pcpu->time_in_idle);
-	delta_time = (unsigned int)(now - pcpu->time_in_idle_timestamp);
+	delta_idle = (now_idle - pcpu->time_in_idle);
+	delta_time = (now - pcpu->time_in_idle_timestamp);
 
 	if (delta_time <= delta_idle)
 		active_time = 0;
@@ -1280,6 +1283,7 @@ static struct input_handler cpufreq_interactive_input_handler = {
 static void rockchip_cpufreq_policy_init(struct cpufreq_policy *policy)
 {
 	struct cpufreq_interactive_tunables *tunables = policy->governor_data;
+	int index;
 
 	tunables->min_sample_time = 40 * USEC_PER_MSEC;
 	tunables->boostpulse_duration_val = 40 * USEC_PER_MSEC;
@@ -1290,6 +1294,12 @@ static void rockchip_cpufreq_policy_init(struct cpufreq_policy *policy)
 	} else {
 		tunables->hispeed_freq = 816000;
 	}
+
+	index = (policy->cpu == 0) ? 0 : 1;
+	if (!backup_tunables[index].usage_count)
+		backup_tunables[index] = *tunables;
+	else
+		*tunables = backup_tunables[index];
 }
 #endif
 
@@ -1308,7 +1318,8 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 	else
 		tunables = common_tunables;
 
-	WARN_ON(!tunables && (event != CPUFREQ_GOV_POLICY_INIT));
+	if (WARN_ON(!tunables && (event != CPUFREQ_GOV_POLICY_INIT)))
+		return -EINVAL;
 
 	switch (event) {
 	case CPUFREQ_GOV_POLICY_INIT:
@@ -1387,6 +1398,15 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			sysfs_remove_group(get_governor_parent_kobj(policy),
 					get_sysfs_attr());
 
+#ifdef CONFIG_ARCH_ROCKCHIP
+			if (policy->cpu == 0) {
+				backup_tunables[0] = *tunables;
+				backup_tunables[0].usage_count = 1;
+			} else {
+				backup_tunables[1] = *tunables;
+				backup_tunables[1].usage_count = 1;
+			}
+#endif
 			kfree(tunables);
 			common_tunables = NULL;
 		}
@@ -1486,6 +1506,7 @@ static int __init cpufreq_interactive_init(void)
 	unsigned int i;
 	struct cpufreq_interactive_cpuinfo *pcpu;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
+	int ret = 0;
 
 	/* Initalize per-cpu timers */
 	for_each_possible_cpu(i) {
@@ -1514,7 +1535,12 @@ static int __init cpufreq_interactive_init(void)
 	/* NB: wake up so the thread does not look hung to the freezer */
 	wake_up_process(speedchange_task);
 
-	return cpufreq_register_governor(&cpufreq_gov_interactive);
+	ret = cpufreq_register_governor(&cpufreq_gov_interactive);
+	if (ret) {
+		kthread_stop(speedchange_task);
+		put_task_struct(speedchange_task);
+	}
+	return ret;
 }
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_INTERACTIVE

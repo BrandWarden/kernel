@@ -32,7 +32,6 @@
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/rockchip/cpu.h>
-#include <linux/rockchip/cru.h>
 #include <asm/cacheflush.h>
 #include "iep_drv.h"
 #include "hw_iep_reg.h"
@@ -288,6 +287,7 @@ static void iep_power_off_work(struct work_struct *work)
 	}
 }
 
+#ifdef CONFIG_FB_ROCKCHIP
 extern void rk_direct_fb_show(struct fb_info *fbi);
 extern struct fb_info* rk_get_fb(int fb_id);
 extern bool rk_fb_poll_wait_frame_complete(void);
@@ -404,7 +404,6 @@ static int iep_switch_dpi(struct iep_reg *reg)
 			bool status;
 			rk_fb_dpi_open(false);
 			status = rk_fb_poll_wait_frame_complete();
-
 			iep_drvdata1->dpi_mode = false;
 			IEP_INFO("%s %d, iep dpi inactivated\n",
 				 __func__, __LINE__);
@@ -413,6 +412,7 @@ static int iep_switch_dpi(struct iep_reg *reg)
 
 	return 0;
 }
+#endif
 
 static void iep_reg_copy_to_hw(struct iep_reg *reg)
 {
@@ -444,8 +444,9 @@ static void iep_switch_fields_order(void)
 {
 	void *pbase = (void *)iep_drvdata1->iep_base;
 	int mode = iep_get_deinterlace_mode(pbase);
+#ifdef CONFIG_FB_ROCKCHIP
 	struct fb_info *fb;
-
+#endif
 	switch (mode) {
 	case dein_mode_I4O1B:
 		iep_set_deinterlace_mode(dein_mode_I4O1T, pbase);
@@ -462,10 +463,10 @@ static void iep_switch_fields_order(void)
 	default:
 		;
 	}
-
+#ifdef CONFIG_FB_ROCKCHIP
 	fb = rk_get_fb(1);
 	rk_direct_fb_show(fb);
-
+#endif
 	/*iep_switch_input_address(pbase);*/
 }
 
@@ -507,9 +508,9 @@ static void iep_try_start_frm(void)
 	if (list_empty(&iep_service.running)) {
 		if (!list_empty(&iep_service.ready)) {
 			reg = list_entry(iep_service.ready.next, struct iep_reg, status_link);
-
+#ifdef CONFIG_FB_ROCKCHIP
 			iep_switch_dpi(reg);
-
+#endif
 			iep_reg_from_ready_to_running(reg);
 			iep_config_frame_end_int_en(iep_drvdata1->iep_base);
 			iep_config_done(iep_drvdata1->iep_base);
@@ -1051,7 +1052,7 @@ static int iep_drv_probe(struct platform_device *pdev)
 	case 1:
 		data->cap.compression_noise_reduction_supported = 0;
 		data->cap.sampling_noise_reduction_supported = 0;
-		if (soc_is_rk3126b()) {
+		if (soc_is_rk3126b() || soc_is_rk3126c()) {
 			data->cap.i4_deinterlace_supported = 0;
 			data->cap.hsb_enhancement_supported = 0;
 			data->cap.cg_enhancement_supported = 0;

@@ -8,6 +8,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/soc/rockchip/rk_vendor_storage.h>
 
 int (*_vendor_read)(u32 id, void *pbuf, u32 size) = NULL;
 int (*_vendor_write)(u32 id, void *pbuf, u32 size) = NULL;
@@ -38,3 +39,11 @@ int rk_vendor_register(void *read, void *write)
 	return -1;
 }
 EXPORT_SYMBOL(rk_vendor_register);
+
+bool is_rk_vendor_ready(void)
+{
+	if (_vendor_read && _vendor_write)
+		return true;
+	return false;
+}
+EXPORT_SYMBOL(is_rk_vendor_ready);

@@ -1,7 +1,7 @@
 /*
  * Linux cfg80211 driver - Android related functions
  *
- * Copyright (C) 1999-2016, Broadcom Corporation
+ * Copyright (C) 1999-2017, Broadcom Corporation
  * 
  *      Unless you and Broadcom execute a separate written software license
  * agreement governing use of this software, this software is licensed to you
@@ -24,7 +24,7 @@
  *
  * <<Broadcom-WL-IPTag/Open:>>
  *
- * $Id: wl_android.h 608194 2015-12-24 04:34:35Z $
+ * $Id: wl_android.h 607319 2015-12-18 14:16:55Z $
  */
 
 #ifndef _wl_android_
@@ -33,15 +33,31 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <wldev_common.h>
+#include <dngl_stats.h>
+#include <dhd.h>
 
 /* If any feature uses the Generic Netlink Interface, put it here to enable WL_GENL
  * automatically
  */
-#if defined(BT_WIFI_HANDOVER) || defined(WL_NAN)
+#if defined(BT_WIFI_HANDOVER)
 #define WL_GENL
 #endif
 
 
+
+typedef struct _android_wifi_priv_cmd {
+    char *buf;
+    int used_len;
+    int total_len;
+} android_wifi_priv_cmd;
+
+#ifdef CONFIG_COMPAT
+typedef struct _compat_android_wifi_priv_cmd {
+    compat_caddr_t buf;
+    int used_len;
+    int total_len;
+} compat_android_wifi_priv_cmd;
+#endif /* CONFIG_COMPAT */
 
 /**
  * Android platform dependent functions, feel free to add Android specific functions here
@@ -53,6 +69,7 @@
 #define ANDROID_ERROR_LEVEL	0x0001
 #define ANDROID_TRACE_LEVEL	0x0002
 #define ANDROID_INFO_LEVEL	0x0004
+#define ANDROID_EVENT_LEVEL	0x0008
 
 #define ANDROID_ERROR(x) \
 	do { \
@@ -75,6 +92,13 @@
 			printk x; \
 		} \
 	} while (0)
+#define ANDROID_EVENT(x) \
+	do { \
+		if (android_msg_level & ANDROID_EVENT_LEVEL) { \
+			printk(KERN_ERR "ANDROID-EVENT) ");	\
+			printk x; \
+		} \
+	} while (0)
 
 /**
  * wl_android_init will be called from module init function (dhd_module_init now), similarly
@@ -86,8 +110,33 @@ void wl_android_post_init(void);
 int wl_android_wifi_on(struct net_device *dev);
 int wl_android_wifi_off(struct net_device *dev, bool on_failure);
 int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd);
+int wl_handle_private_cmd(struct net_device *net, char *command, u32 cmd_len);
 
-s32 wl_netlink_send_msg(int pid, int type, int seq, void *data, size_t size);
+s32 wl_netlink_send_msg(int pid, int type, int seq, const void *data, size_t size);
+#ifdef WL_EXT_IAPSTA
+int wl_ext_iapsta_attach_netdev(struct net_device *net, int ifidx, uint8 bssidx);
+int wl_ext_iapsta_attach_name(struct net_device *net, int ifidx);
+int wl_ext_iapsta_dettach_netdev(struct net_device *net, int ifidx);
+u32 wl_ext_iapsta_update_channel(struct net_device *dev, u32 channel);
+int wl_ext_iapsta_alive_preinit(struct net_device *dev);
+int wl_ext_iapsta_alive_postinit(struct net_device *dev);
+int wl_ext_iapsta_event(struct net_device *dev, wl_event_msg_t *e, void* data);
+int wl_ext_iapsta_attach(dhd_pub_t *pub);
+void wl_ext_iapsta_dettach(dhd_pub_t *pub);
+extern int op_mode;
+#endif
+int wl_android_ext_priv_cmd(struct net_device *net, char *command, int total_len,
+	int *bytes_written);
+typedef struct wl_conn_info {
+	uint8 bssidx;
+	wlc_ssid_t ssid;
+	struct ether_addr bssid;
+	uint16 channel;
+} wl_conn_info_t;
+s32 wl_ext_connect(struct net_device *dev, wl_conn_info_t *conn_info);
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+#define strnicmp(str1, str2, len) strncasecmp((str1), (str2), (len))
+#endif
 
 /* hostap mac mode */
 #define MACLIST_MODE_DISABLED   0
@@ -107,7 +156,6 @@ s32 wl_netlink_send_msg(int pid, int type, int seq, void *data, size_t size);
 #define MAX_NUM_MAC_FILT        10
 
 int wl_android_set_ap_mac_list(struct net_device *dev, int macmode, struct maclist *maclist);
-int wl_android_set_roam_offload_bssid_list(struct net_device *dev, const char *cmd);
 
 /* terence:
  * BSSCACHE: Cache bss list
@@ -128,6 +176,10 @@ int wl_android_set_roam_offload_bssid_list(struct net_device *dev, const char *c
 #define REPEATED_SCAN_RESULT_CNT	2
 #else
 #define REPEATED_SCAN_RESULT_CNT	1
+#endif
+
+#if defined(RSSIAVG) || defined(RSSIOFFSET)
+extern int g_wifi_on;
 #endif
 
 #if defined(RSSIAVG)
@@ -185,11 +237,19 @@ void wl_free_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl);
 void wl_delete_dirty_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl);
 void wl_delete_disconnected_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl, u8 *bssid);
 void wl_reset_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl);
-void wl_update_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl,	
+void wl_update_bss_cache(wl_bss_cache_ctrl_t *bss_cache_ctrl,
 #if defined(RSSIAVG)
 	wl_rssi_cache_ctrl_t *rssi_cache_ctrl,
 #endif
 	wl_scan_results_t *ss_list);
 void wl_release_bss_cache_ctrl(wl_bss_cache_ctrl_t *bss_cache_ctrl);
 #endif
+int wl_ext_get_best_channel(struct net_device *net,
+#if defined(BSSCACHE)
+	wl_bss_cache_ctrl_t *bss_cache_ctrl,
+#else
+	struct wl_scan_results *bss_list,
+#endif
+	int ioctl_ver, int *best_2g_ch, int *best_5g_ch
+);
 #endif /* _wl_android_ */

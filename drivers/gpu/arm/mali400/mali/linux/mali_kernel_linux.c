@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2010-2016 ARM Limited. All rights reserved.
+ * Copyright (C) 2010-2017 ARM Limited. All rights reserved.
  * 
  * This program is free software and is provided to you under the terms of the GNU General Public License version 2
  * as published by the Free Software Foundation, and any use by you of this program is subject to the terms of such GNU licence.
@@ -30,8 +30,9 @@
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/regulator/consumer.h>
-
 #include <linux/mali/mali_utgard.h>
+#include <soc/rockchip/rockchip_opp_select.h>
+
 #include "mali_kernel_common.h"
 #include "mali_session.h"
 #include "mali_kernel_core.h"
@@ -203,6 +204,8 @@ extern int mali_platform_device_register(void);
 extern int mali_platform_device_unregister(void);
 #endif
 #endif
+
+extern int rk_platform_init_opp_table(struct device *dev);
 
 /* Linux power management operations provided by the Mali device driver */
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 29))
@@ -574,12 +577,9 @@ static int mali_probe(struct platform_device *pdev)
 	}
 #endif /* LINUX_VERSION_CODE >= 3, 12, 0 */
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)) && defined(CONFIG_OF) \
-                        && defined(CONFIG_PM_OPP)
-	/* Register the OPPs if they are available in device tree */
-	if (dev_pm_opp_of_add_table(mdev->dev) < 0)
-		MALI_DEBUG_PRINT(3, ("OPP table not found\n"));
-#endif
+	err = rk_platform_init_opp_table(mdev->dev);
+	if (err)
+		MALI_DEBUG_PRINT(3, ("Failed to init_opp_table\n"));
 
 	/* Need to name the gpu clock "clk_mali" in the device tree */
 	mdev->clock = clk_get(mdev->dev, "clk_mali");
@@ -588,9 +588,9 @@ static int mali_probe(struct platform_device *pdev)
 		mdev->clock = NULL;
 		/* Allow probe to continue without clock. */
 	} else {
-		err = clk_prepare_enable(mdev->clock);
+		err = clk_prepare(mdev->clock);
 		if (err) {
-			MALI_PRINT_ERROR(("Failed to prepare and enable clock (%d)\n", err));
+			MALI_PRINT_ERROR(("Failed to prepare clock (%d)\n", err));
 			goto clock_prepare_failed;
 		}
 	}
@@ -640,7 +640,7 @@ static int mali_probe(struct platform_device *pdev)
 devfreq_init_failed:
 	mali_pm_metrics_term(mdev);
 pm_metrics_init_failed:
-	clk_disable_unprepare(mdev->clock);
+	clk_unprepare(mdev->clock);
 clock_prepare_failed:
 	clk_put(mdev->clock);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)) && defined(CONFIG_OF) \
@@ -680,7 +680,7 @@ static int mali_remove(struct platform_device *pdev)
 	mali_pm_metrics_term(mdev);
 
 	if (mdev->clock) {
-		clk_disable_unprepare(mdev->clock);
+		clk_unprepare(mdev->clock);
 		clk_put(mdev->clock);
 		mdev->clock = NULL;
 	}

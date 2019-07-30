@@ -1,11 +1,10 @@
 /*
- * This confidential and proprietary software may be used only as
- * authorised by a licensing agreement from ARM Limited
- * (C) COPYRIGHT 2009-2010, 2012 ARM Limited
- * ALL RIGHTS RESERVED
- * The entire notice above must be reproduced on all authorised
- * copies and copies may only be made to the extent permitted
- * by a licensing agreement from ARM Limited.
+ * (C) COPYRIGHT RockChip Limited. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
  */
 
 /**
@@ -34,7 +33,9 @@
 #include <linux/workqueue.h>
 #include <linux/dma-mapping.h>
 #include <linux/pm_runtime.h>
+#include <linux/delay.h>
 #include <linux/rockchip/cpu.h>
+#include <soc/rockchip/rockchip_opp_select.h>
 
 #include <linux/mali/mali_utgard.h>
 #include "mali_kernel_common.h"
@@ -46,6 +47,8 @@ u32 mali_group_error;
 
 /*---------------------------------------------------------------------------*/
 
+#define DEFAULT_UTILISATION_PERIOD_IN_MS (100)
+
 /*
  * rk_platform_context_of_mali_device.
  */
@@ -54,22 +57,115 @@ struct rk_context {
 	struct device *dev;
 	/* is the GPU powered on?  */
 	bool is_powered;
+	/* debug only, the period in ms to count gpu_utilisation. */
+	unsigned int utilisation_period;
 };
 
 struct rk_context *s_rk_context;
 
-/*-------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
 
-static int rk_context_create_sysfs_files(struct device *dev)
+#ifdef CONFIG_MALI_DEVFREQ
+static ssize_t utilisation_period_show(struct device *dev,
+				       struct device_attribute *attr,
+				       char *buf)
 {
-	int ret = 0;
+	struct rk_context *platform = s_rk_context;
+	ssize_t ret = 0;
+
+	ret += snprintf(buf, PAGE_SIZE, "%u\n", platform->utilisation_period);
 
 	return ret;
 }
 
+static ssize_t utilisation_period_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf,
+					size_t count)
+{
+	struct rk_context *platform = s_rk_context;
+	int ret = 0;
+
+	ret = kstrtouint(buf, 0, &platform->utilisation_period);
+	if (ret) {
+		E("invalid input period : %s.", buf);
+		return ret;
+	}
+	D("set utilisation_period to '%d'.", platform->utilisation_period);
+
+	return count;
+}
+
+static ssize_t utilisation_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct rk_context *platform = s_rk_context;
+	struct mali_device *mdev = dev_get_drvdata(dev);
+	ssize_t ret = 0;
+	unsigned long period_in_us = platform->utilisation_period * 1000;
+	unsigned long total_time;
+	unsigned long busy_time;
+	unsigned long utilisation;
+
+	mali_pm_reset_dvfs_utilisation(mdev);
+	usleep_range(period_in_us, period_in_us + 100);
+	mali_pm_get_dvfs_utilisation(mdev, &total_time, &busy_time);
+
+	/* 'devfreq_dev_profile' instance registered to devfreq
+	 * also uses mali_pm_reset_dvfs_utilisation()
+	 * and mali_pm_get_dvfs_utilisation().
+	 * So, it's better to disable GPU DVFS before reading this node.
+	 */
+	D("total_time : %lu, busy_time : %lu.", total_time, busy_time);
+
+	utilisation = busy_time / (total_time / 100);
+	ret += snprintf(buf, PAGE_SIZE, "%lu\n", utilisation);
+
+	return ret;
+}
+
+static DEVICE_ATTR_RW(utilisation_period);
+static DEVICE_ATTR_RO(utilisation);
+#endif
+
+static int rk_context_create_sysfs_files(struct device *dev)
+{
+#ifdef CONFIG_MALI_DEVFREQ
+	int ret;
+
+	ret = device_create_file(dev, &dev_attr_utilisation_period);
+	if (ret) {
+		E("fail to create sysfs file 'utilisation_period'.");
+		goto out;
+	}
+
+	ret = device_create_file(dev, &dev_attr_utilisation);
+	if (ret) {
+		E("fail to create sysfs file 'utilisation'.");
+		goto remove_utilisation_period;
+	}
+
+	return 0;
+
+remove_utilisation_period:
+	device_remove_file(dev, &dev_attr_utilisation_period);
+out:
+	return ret;
+#else
+	return 0;
+#endif
+}
+
 static void rk_context_remove_sysfs_files(struct device *dev)
 {
+#ifdef CONFIG_MALI_DEVFREQ
+	device_remove_file(dev, &dev_attr_utilisation_period);
+	device_remove_file(dev, &dev_attr_utilisation);
+#endif
 }
+
+/*---------------------------------------------------------------------------*/
 
 /*
  * Init rk_platform_context of mali_device.
@@ -88,6 +184,8 @@ static int rk_context_init(struct platform_device *pdev)
 
 	platform->dev = dev;
 	platform->is_powered = false;
+
+	platform->utilisation_period = DEFAULT_UTILISATION_PERIOD_IN_MS;
 
 	ret = rk_context_create_sysfs_files(dev);
 	if (ret) {
@@ -130,14 +228,84 @@ static void rk_context_deinit(struct platform_device *pdev)
 
 #define FALLBACK_STATIC_TEMPERATURE 55000
 
+static u32 dynamic_coefficient;
+static u32 static_coefficient;
+static s32 ts[4];
 static struct thermal_zone_device *gpu_tz;
 
+static int power_model_simple_init(struct platform_device *pdev)
+{
+	struct device_node *power_model_node;
+	const char *tz_name;
+	u32 static_power, dynamic_power;
+	u32 voltage, voltage_squared, voltage_cubed, frequency;
+
+	power_model_node = of_get_child_by_name(pdev->dev.of_node,
+			"power_model");
+	if (!power_model_node) {
+		dev_err(&pdev->dev, "could not find power_model node\n");
+		return -ENODEV;
+	}
+	if (!of_device_is_compatible(power_model_node,
+			"arm,mali-simple-power-model")) {
+		dev_err(&pdev->dev, "power_model incompatible with simple power model\n");
+		return -ENODEV;
+	}
+
+	if (of_property_read_string(power_model_node, "thermal-zone",
+			&tz_name)) {
+		dev_err(&pdev->dev, "ts in power_model not available\n");
+		return -EINVAL;
+	}
+
+	gpu_tz = thermal_zone_get_zone_by_name(tz_name);
+	if (IS_ERR(gpu_tz)) {
+		pr_warn_ratelimited("Error getting gpu thermal zone '%s'(%ld), not yet ready?\n",
+				tz_name,
+				PTR_ERR(gpu_tz));
+		gpu_tz = NULL;
+	}
+
+	if (of_property_read_u32(power_model_node, "static-power",
+			&static_power)) {
+		dev_err(&pdev->dev, "static-power in power_model not available\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32(power_model_node, "dynamic-power",
+			&dynamic_power)) {
+		dev_err(&pdev->dev, "dynamic-power in power_model not available\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32(power_model_node, "voltage",
+			&voltage)) {
+		dev_err(&pdev->dev, "voltage in power_model not available\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32(power_model_node, "frequency",
+			&frequency)) {
+		dev_err(&pdev->dev, "frequency in power_model not available\n");
+		return -EINVAL;
+	}
+	voltage_squared = (voltage * voltage) / 1000;
+	voltage_cubed = voltage * voltage * voltage;
+	static_coefficient = (static_power << 20) / (voltage_cubed >> 10);
+	dynamic_coefficient = (((dynamic_power * 1000) / voltage_squared)
+			* 1000) / frequency;
+
+	if (of_property_read_u32_array(power_model_node, "ts", (u32 *)ts, 4)) {
+		dev_err(&pdev->dev, "ts in power_model not available\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 /* Calculate gpu static power example for reference */
-static unsigned long rk_model_static_power(unsigned long voltage)
+static unsigned long rk_model_static_power(struct devfreq *devfreq,
+					   unsigned long voltage)
 {
 	int temperature, temp;
 	int temp_squared, temp_cubed, temp_scaling_factor;
-	const unsigned long coefficient = (410UL << 20) / (729000000UL >> 10);
 	const unsigned long voltage_cubed = (voltage * voltage * voltage) >> 10;
 	unsigned long static_power;
 
@@ -160,12 +328,12 @@ static unsigned long rk_model_static_power(unsigned long voltage)
 	temp_squared = temp * temp;
 	temp_cubed = temp_squared * temp;
 	temp_scaling_factor =
-		(2 * temp_cubed)
-		- (80 * temp_squared)
-		+ (4700 * temp)
-		+ 32000;
+			(ts[3] * temp_cubed)
+			+ (ts[2] * temp_squared)
+			+ (ts[1] * temp)
+			+ ts[0];
 
-	static_power = (((coefficient * voltage_cubed) >> 20)
+	static_power = (((static_coefficient * voltage_cubed) >> 20)
 			* temp_scaling_factor)
 		       / 1000000;
 
@@ -173,7 +341,8 @@ static unsigned long rk_model_static_power(unsigned long voltage)
 }
 
 /* Calculate gpu dynamic power example for reference */
-static unsigned long rk_model_dynamic_power(unsigned long freq,
+static unsigned long rk_model_dynamic_power(struct devfreq *devfreq,
+					    unsigned long freq,
 					    unsigned long voltage)
 {
 	/* The inputs: freq (f) is in Hz, and voltage (v) in mV.
@@ -184,10 +353,9 @@ static unsigned long rk_model_dynamic_power(unsigned long freq,
 	 */
 	const unsigned long v2 = (voltage * voltage) / 1000; /* m*(V*V) */
 	const unsigned long f_mhz = freq / 1000000; /* MHz */
-	const unsigned long coefficient = 3600; /* mW/(MHz*mV*mV) */
 	unsigned long dynamic_power;
 
-	dynamic_power = (coefficient * v2 * f_mhz) / 1000000; /* mW */
+	dynamic_power = (dynamic_coefficient * v2 * f_mhz) / 1000000; /* mW */
 
 	return dynamic_power;
 }
@@ -277,6 +445,11 @@ static void rk_platform_power_off_gpu(struct device *dev)
 	rk_platform_disable_gpu_regulator(dev);
 }
 
+int rk_platform_init_opp_table(struct device *dev)
+{
+	return rockchip_init_opp_table(dev, NULL, "gpu_leakage", "mali");
+}
+
 static int mali_runtime_suspend(struct device *device)
 {
 	int ret = 0;
@@ -290,7 +463,8 @@ static int mali_runtime_suspend(struct device *device)
 		ret = device->driver->pm->runtime_suspend(device);
 	}
 
-	rk_platform_power_off_gpu(device);
+	if (!ret)
+		rk_platform_power_off_gpu(device);
 
 	return ret;
 }
@@ -328,8 +502,6 @@ static int mali_runtime_idle(struct device *device)
 			return ret;
 	}
 
-	pm_runtime_suspend(device);
-
 	return 0;
 }
 #endif
@@ -347,7 +519,8 @@ static int mali_os_suspend(struct device *device)
 		ret = device->driver->pm->suspend(device);
 	}
 
-	rk_platform_power_off_gpu(device);
+	if (!ret)
+		rk_platform_power_off_gpu(device);
 
 	return ret;
 }
@@ -423,7 +596,7 @@ static const struct device_type mali_gpu_device_device_type = {
  */
 static const struct mali_gpu_device_data mali_gpu_data = {
 	.shared_mem_size = 1024 * 1024 * 1024, /* 1GB */
-	.max_job_runtime = 100, /* 100 ms */
+	.max_job_runtime = 60000, /* 60 seconds */
 #if defined(CONFIG_MALI_DEVFREQ) && defined(CONFIG_DEVFREQ_THERMAL)
 	.gpu_cooling_ops = &rk_cooling_ops,
 #endif
@@ -453,27 +626,34 @@ int mali_platform_device_init(struct platform_device *pdev)
 				       sizeof(mali_gpu_data));
 	if (err) {
 		E("fail to add platform_specific_data. err : %d.", err);
-		goto EXIT;
+		goto add_data_failed;
 	}
 
 	err = rk_context_init(pdev);
 	if (err) {
 		E("fail to init rk_context. err : %d.", err);
-		goto EXIT;
+		goto init_rk_context_failed;
 	}
 
 #if defined(CONFIG_MALI_DEVFREQ) && defined(CONFIG_DEVFREQ_THERMAL)
-	/* Get thermal zone */
-	gpu_tz = thermal_zone_get_zone_by_name("gpu_thermal");
-	if (IS_ERR(gpu_tz)) {
-		W("Error getting gpu thermal zone (%ld), not yet ready?",
-		  PTR_ERR(gpu_tz));
-		gpu_tz = NULL;
-		/* err =  -EPROBE_DEFER; */
+	if (of_machine_is_compatible("rockchip,rk3036"))
+		return 0;
+
+	err = power_model_simple_init(pdev);
+	if (err) {
+		E("fail to init simple_power_model, err : %d.", err);
+		goto init_power_model_failed;
 	}
 #endif
 
-EXIT:
+	return 0;
+
+#if defined(CONFIG_MALI_DEVFREQ) && defined(CONFIG_DEVFREQ_THERMAL)
+init_power_model_failed:
+	rk_context_deinit(pdev);
+#endif
+init_rk_context_failed:
+add_data_failed:
 	return err;
 }
 

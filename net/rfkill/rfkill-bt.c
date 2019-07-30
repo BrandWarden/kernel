@@ -290,18 +290,21 @@ static int rfkill_rk_set_power(void *data, bool blocked)
 
         rfkill_rk_sleep_bt(BT_WAKEUP); // ensure bt is wakeup
 
-		if (gpio_is_valid(poweron->io))
-        {
+	if (gpio_is_valid(poweron->io)) {
+		if (gpio_get_value(poweron->io) == !poweron->enable) {
 			gpio_direction_output(poweron->io, !poweron->enable);
-            msleep(20);
+			msleep(20);
 			gpio_direction_output(poweron->io, poweron->enable);
-            msleep(20);
+			msleep(20);
+		}
         }
-		if (gpio_is_valid(reset->io))
-        {
+
+	if (gpio_is_valid(reset->io)) {
+		if (gpio_get_value(reset->io) == !reset->enable) {
 			gpio_direction_output(reset->io, !reset->enable);
-            msleep(20);
+			msleep(20);
 			gpio_direction_output(reset->io, reset->enable);
+		}
         }
 
         if (pinctrl != NULL && gpio_is_valid(rts->io))
@@ -318,20 +321,23 @@ static int rfkill_rk_set_power(void *data, bool blocked)
         bt_power_state = 1;
     	LOG("bt turn on power\n");
 	} else {
-            if (gpio_is_valid(poweron->io))
-            {      
-                gpio_direction_output(poweron->io, !poweron->enable);
-                msleep(20);
-            }
+		if (gpio_is_valid(poweron->io)) {
+			if (gpio_get_value(poweron->io) == poweron->enable) {
+				gpio_direction_output(poweron->io,
+						      !poweron->enable);
+				msleep(20);
+			}
+		}
 
-            bt_power_state = 0;
-    		LOG("bt shut off power\n");
-		if (gpio_is_valid(reset->io))
-        {      
-			gpio_direction_output(reset->io, !reset->enable);/* bt reset active*/
-            msleep(20);
-        }
-
+		bt_power_state = 0;
+		LOG("bt shut off power\n");
+		if (gpio_is_valid(reset->io)) {
+			if (gpio_get_value(reset->io) == reset->enable) {
+				gpio_direction_output(reset->io,
+						      !reset->enable);
+				msleep(20);
+			}
+		}
 	}
 
 	return 0;
@@ -493,8 +499,8 @@ static int bluetooth_platdata_parse_dt(struct device *dev,
         }
     } else {
         data->pinctrl = NULL;
-        LOG("%s: uart_rts_gpios is unvalid.\n", __func__);
-        return -EINVAL;
+        data->rts_gpio.io = -EINVAL;
+        LOG("%s: uart_rts_gpios is no-in-use.\n", __func__);
     }
 
     gpio = of_get_named_gpio_flags(node, "BT,power_gpio", 0, &flags);
@@ -701,7 +707,7 @@ static int rfkill_rk_remove(struct platform_device *pdev)
         gpio_free(rfkill->pdata->reset_gpio.io);
     
     if (gpio_is_valid(rfkill->pdata->poweron_gpio.io))
-        gpio_free(rfkill->pdata->poweron_gpio.io);
+		gpio_free(rfkill->pdata->poweron_gpio.io);
 	clk_disable_unprepare(rfkill->pdata->ext_clk);
     g_rfkill = NULL;
 

@@ -109,26 +109,26 @@
   Gravity_step: gravity value indicated by per count
  */
 #define FREAD_MASK				0 /* enabled(1<<1) only if reading MSB 8bits*/
-#define MMA845X_RANGE			2000000
+#define MMA845X_RANGE		(16384 * 2)
 /* mma8451 */
 #define MMA8451_PRECISION       14
 #define MMA8451_BOUNDARY        (0x1 << (MMA8451_PRECISION - 1))
-#define MMA8451_GRAVITY_STEP    MMA845X_RANGE / MMA8451_BOUNDARY
+#define MMA8451_GRAVITY_STEP    (MMA845X_RANGE / MMA8451_BOUNDARY)
 
 /* mma8452 */
 #define MMA8452_PRECISION       12
 #define MMA8452_BOUNDARY        (0x1 << (MMA8452_PRECISION - 1))
-#define MMA8452_GRAVITY_STEP    MMA845X_RANGE / MMA8452_BOUNDARY
+#define MMA8452_GRAVITY_STEP    (MMA845X_RANGE / MMA8452_BOUNDARY)
 
 /* mma8453 */
 #define MMA8453_PRECISION       10
 #define MMA8453_BOUNDARY        (0x1 << (MMA8453_PRECISION - 1))
-#define MMA8453_GRAVITY_STEP    MMA845X_RANGE / MMA8453_BOUNDARY
+#define MMA8453_GRAVITY_STEP    (MMA845X_RANGE / MMA8453_BOUNDARY)
 
 /* mma8653 */
 #define MMA8653_PRECISION       10
 #define MMA8653_BOUNDARY        (0x1 << (MMA8653_PRECISION - 1))
-#define MMA8653_GRAVITY_STEP    MMA845X_RANGE / MMA8653_BOUNDARY
+#define MMA8653_GRAVITY_STEP    (MMA845X_RANGE / MMA8653_BOUNDARY)
 
 
 #define MMA8451_DEVID		0x1a
@@ -251,10 +251,10 @@ static int sensor_convert_data(struct i2c_client *client, char high_byte, char l
 			result = ((int)high_byte << (MMA8451_PRECISION-8)) 
 					| ((int)low_byte >> (16-MMA8451_PRECISION));
 			if (result < MMA8451_BOUNDARY)
-				result = result* MMA8451_GRAVITY_STEP;
+				result = result * MMA8451_GRAVITY_STEP;
 			else
-				result = ~( ((~result & (0x7fff>>(16-MMA8451_PRECISION)) ) + 1) 
-						* MMA8451_GRAVITY_STEP) + 1;
+				result = ~(((~result & (0x7fff >> (16 - MMA8451_PRECISION))) + 1)
+					* MMA8451_GRAVITY_STEP) + 1;
 			break;
 
 		case MMA8452_DEVID:			
@@ -262,10 +262,10 @@ static int sensor_convert_data(struct i2c_client *client, char high_byte, char l
 			result = ((int)high_byte << (MMA8452_PRECISION-8)) 
 					| ((int)low_byte >> (16-MMA8452_PRECISION));
 			if (result < MMA8452_BOUNDARY)
-				result = result* MMA8452_GRAVITY_STEP;
+				result = result * MMA8452_GRAVITY_STEP;
 			else
-				result = ~( ((~result & (0x7fff>>(16-MMA8452_PRECISION)) ) + 1) 
-						* MMA8452_GRAVITY_STEP) + 1;
+				result = ~(((~result & (0x7fff >> (16 - MMA8452_PRECISION))) + 1)
+					* MMA8452_GRAVITY_STEP) + 1;
 			break;
 			
 		case MMA8453_DEVID:
@@ -273,10 +273,10 @@ static int sensor_convert_data(struct i2c_client *client, char high_byte, char l
 			result = ((int)high_byte << (MMA8453_PRECISION-8)) 
 					| ((int)low_byte >> (16-MMA8453_PRECISION));
 			if (result < MMA8453_BOUNDARY)
-				result = result* MMA8453_GRAVITY_STEP;
+				result = result * MMA8453_GRAVITY_STEP;
 			else
-				result = ~( ((~result & (0x7fff>>(16-MMA8453_PRECISION)) ) + 1) 
-						* MMA8453_GRAVITY_STEP) + 1;
+				result = ~(((~result & (0x7fff >> (16 - MMA8453_PRECISION))) + 1)
+					* MMA8453_GRAVITY_STEP) + 1;
 			break;
 
 		case MMA8653_DEVID:
@@ -284,10 +284,10 @@ static int sensor_convert_data(struct i2c_client *client, char high_byte, char l
 			result = ((int)high_byte << (MMA8653_PRECISION-8)) 
 					| ((int)low_byte >> (16-MMA8653_PRECISION));
 			if (result < MMA8653_BOUNDARY)
-				result = result* MMA8653_GRAVITY_STEP;
+				result = result * MMA8653_GRAVITY_STEP;
 			else
-				result = ~( ((~result & (0x7fff>>(16-MMA8653_PRECISION)) ) + 1) 
-						* MMA8653_GRAVITY_STEP) + 1;
+				result = ~(((~result & (0x7fff >> (16 - MMA8653_PRECISION))) + 1)
+					* MMA8653_GRAVITY_STEP) + 1;
 			break;
 
 		default:
@@ -303,12 +303,13 @@ static int gsensor_report_value(struct i2c_client *client, struct sensor_axis *a
 	struct sensor_private_data *sensor =
 	    (struct sensor_private_data *) i2c_get_clientdata(client);	
 
-	/* Report acceleration sensor information */
-	input_report_abs(sensor->input_dev, ABS_X, axis->x);
-	input_report_abs(sensor->input_dev, ABS_Y, axis->y);
-	input_report_abs(sensor->input_dev, ABS_Z, axis->z);
-	input_sync(sensor->input_dev);
-	DBG("Gsensor x==%d  y==%d z==%d\n",axis->x,axis->y,axis->z);
+	if (sensor->status_cur == SENSOR_ON) {
+		/* Report acceleration sensor information */
+		input_report_abs(sensor->input_dev, ABS_X, axis->x);
+		input_report_abs(sensor->input_dev, ABS_Y, axis->y);
+		input_report_abs(sensor->input_dev, ABS_Z, axis->z);
+		input_sync(sensor->input_dev);
+	}
 
 	return 0;
 }
@@ -351,18 +352,11 @@ static int sensor_report_value(struct i2c_client *client)
 	axis.y = (pdata->orientation[3])*x + (pdata->orientation[4])*y + (pdata->orientation[5])*z; 
 	axis.z = (pdata->orientation[6])*x + (pdata->orientation[7])*y + (pdata->orientation[8])*z;
 
-	DBG( "%s: axis = %d  %d  %d \n", __func__, axis.x, axis.y, axis.z);
+	gsensor_report_value(client, &axis);
 
-	//Report event only while value is changed to save some power
-	if((abs(sensor->axis.x - axis.x) > GSENSOR_MIN) || (abs(sensor->axis.y - axis.y) > GSENSOR_MIN) || (abs(sensor->axis.z - axis.z) > GSENSOR_MIN))
-	{
-		gsensor_report_value(client, &axis);
-
-		/* »¥³âµØ»º´æÊý¾Ý. */
-		mutex_lock(&(sensor->data_mutex) );
-		sensor->axis = axis;
-		mutex_unlock(&(sensor->data_mutex) );
-	}
+	mutex_lock(&sensor->data_mutex);
+	sensor->axis = axis;
+	mutex_unlock(&sensor->data_mutex);
 
 	if((sensor->pdata->irq_enable)&& (sensor->ops->int_status_reg >= 0))	//read sensor intterupt status register
 	{
@@ -376,19 +370,19 @@ static int sensor_report_value(struct i2c_client *client)
 
 
 struct sensor_operate gsensor_mma8452_ops = {
-	.name				= "mma8452",
-	.type				= SENSOR_TYPE_ACCEL,			//sensor type and it should be correct
-	.id_i2c				= ACCEL_ID_MMA845X,				//i2c id number
-	.read_reg			= MMA8452_REG_X_OUT_MSB,		//read data
-	.read_len			= 6,							//data length
-	.id_reg				= SENSOR_UNKNOW_DATA,			//read device id from this register
-	.id_data 			= SENSOR_UNKNOW_DATA,			//device id
-	.precision			= MMA8452_PRECISION,			//12 bit
-	.ctrl_reg 			= MMA8452_REG_CTRL_REG1,		//enable or disable 	
-	.int_status_reg 		= MMA8452_REG_INTSRC,			//intterupt status register
-	.range				= {-MMA845X_RANGE,MMA845X_RANGE},	//range
-	.trig				= IRQF_TRIGGER_LOW|IRQF_ONESHOT,		
-	.active				= sensor_active,	
+	.name			= "mma8452",
+	.type			= SENSOR_TYPE_ACCEL,
+	.id_i2c			= ACCEL_ID_MMA845X,
+	.read_reg			= MMA8452_REG_X_OUT_MSB,
+	.read_len			= 6,
+	.id_reg			= SENSOR_UNKNOW_DATA,
+	.id_data			= SENSOR_UNKNOW_DATA,
+	.precision			= MMA8452_PRECISION,
+	.ctrl_reg			= MMA8452_REG_CTRL_REG1,
+	.int_status_reg	= MMA8452_REG_INTSRC,
+	.range			= {-MMA845X_RANGE, MMA845X_RANGE},
+	.trig				= IRQF_TRIGGER_LOW | IRQF_ONESHOT,
+	.active			= sensor_active,
 	.init				= sensor_init,
 	.report 			= sensor_report_value,
 };

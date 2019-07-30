@@ -27,7 +27,6 @@
 #include <linux/regmap.h>
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
-#include <linux/rockchip/common.h>
 #include <linux/reboot.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -92,6 +91,7 @@ enum {
 
 #define MIN_TEMP (-40000)
 #define MAX_TEMP (125000)
+#define INVALID_TEMP INT_MAX
 
 #define BASE (1024)
 #define BASE_SHIFT (10)
@@ -853,7 +853,8 @@ static int rk3368_thermal_notify(struct notifier_block *nb,
 	} else if (event & (REGULATOR_EVENT_VOLTAGE_CHANGE |
 			    REGULATOR_EVENT_ABORT_VOLTAGE_CHANGE)) {
 		ctx->regulator_uv = (unsigned long)data;
-		mutex_unlock(&thermal_reg_mutex);
+		if (mutex_is_locked(&thermal_reg_mutex))
+			mutex_unlock(&thermal_reg_mutex);
 	} else {
 		return NOTIFY_OK;
 	}

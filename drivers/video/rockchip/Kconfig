@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 menuconfig FB_ROCKCHIP
 	tristate "Frame buffer support for Rockchip "
 	depends on FB
@@ -69,4 +70,4 @@ source "drivers/video/rockchip/rga2/Kconfig"
 source "drivers/video/rockchip/vcodec/Kconfig"
 source "drivers/video/rockchip/iep/Kconfig"
 source "drivers/video/rockchip/dp/Kconfig"
-
+source "drivers/video/rockchip/vpu/Kconfig"

@@ -20,6 +20,10 @@
 #include <linux/suspend.h>
 #include <linux/of.h>
 #include <linux/delay.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/soc/rockchip/pvtm.h>
+#include <linux/thermal.h>
+#include <soc/rockchip/rockchip_opp_select.h>
 
 #include "mali_kbase_rk.h"
 
@@ -147,6 +151,7 @@ static void kbase_platform_rk_term(struct kbase_device *kbdev)
 	kbdev->platform_context = NULL;
 
 	if (platform) {
+		cancel_delayed_work_sync(&platform->work);
 		wake_lock_destroy(&platform->wake_lock);
 		destroy_workqueue(platform->power_off_wq);
 		platform->is_powered = false;
@@ -423,4 +428,10 @@ static void kbase_platform_rk_remove_sysfs_files(struct device *dev)
 {
 	device_remove_file(dev, &dev_attr_utilisation_period);
 	device_remove_file(dev, &dev_attr_utilisation);
+}
+
+int kbase_platform_rk_init_opp_table(struct kbase_device *kbdev)
+{
+	return rockchip_init_opp_table(kbdev->dev, NULL,
+				       "gpu_leakage", "mali");
 }

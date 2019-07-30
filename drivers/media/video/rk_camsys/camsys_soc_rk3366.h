@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __RKCAMSYS_SOC_RK3366_H__
 #define __RKCAMSYS_SOC_RK3366_H__
 
@@ -88,6 +89,9 @@
 *0: disable
 */
 #define MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET  (0x38)
+
+#define MIPI_CSI_DPHY_RX_FORCERXMODE_MASK (0x0f << 24)
+#define MIPI_CSI_DPHY_RX_FORCERXMODE_BIT (0 << 8)
 
 #define CSIHOST_N_LANES_OFFSET 0x04
 #define CSIHOST_N_LANES_OFFSET_BIT (0)

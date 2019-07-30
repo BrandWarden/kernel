@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 
 
 #include <linux/version.h>
@@ -19,7 +20,9 @@
 #include <asm/atomic.h>
 #include <asm/cacheflush.h>
 #include "rga2_mmu_info.h"
-
+#if RGA2_DEBUGFS
+extern int RGA2_CHECK_MODE;
+#endif
 extern struct rga2_service_info rga2_service;
 extern struct rga2_mmu_buf_t rga2_mmu_buf;
 
@@ -42,6 +45,35 @@ static void rga_dma_flush_range(void *pstart, void *pend)
 	outer_flush_range(virt_to_phys(pstart), virt_to_phys(pend));
 #elif defined(CONFIG_ARM64)
 	__dma_flush_range(pstart, pend);
+#endif
+}
+
+static void rga_dma_flush_page(struct page *page)
+{
+	phys_addr_t paddr;
+	void *virt;
+
+	paddr = page_to_phys(page);
+#ifdef CONFIG_ARM
+	if (PageHighMem(page)) {
+		if (cache_is_vipt_nonaliasing()) {
+			virt = kmap_atomic(page);
+			dmac_flush_range(virt, virt + PAGE_SIZE);
+			kunmap_atomic(virt);
+		} else {
+			virt = kmap_high_get(page);
+			dmac_flush_range(virt, virt + PAGE_SIZE);
+			kunmap_high(page);
+		}
+	} else {
+		virt = page_address(page);
+		dmac_flush_range(virt, virt + PAGE_SIZE);
+	}
+
+	outer_flush_range(paddr, paddr + PAGE_SIZE);
+#elif defined(CONFIG_ARM64)
+	virt = page_address(page);
+	__dma_flush_range(virt, virt + PAGE_SIZE);
 #endif
 }
 
@@ -151,7 +183,8 @@ static int rga2_buf_size_cal(unsigned long yrgb_addr, unsigned long uv_addr, uns
             pageCount = (size_yrgb + PAGE_SIZE - 1) >> PAGE_SHIFT;
             break;
         case RGA2_FORMAT_BGRA_8888 :
-            size_yrgb = w*h*4;
+            stride = (w * 4 + 3) & (~3);
+            size_yrgb = stride * h;
             start = yrgb_addr >> PAGE_SHIFT;
             pageCount = (size_yrgb + PAGE_SIZE - 1) >> PAGE_SHIFT;
             break;
@@ -259,6 +292,78 @@ static int rga2_buf_size_cal(unsigned long yrgb_addr, unsigned long uv_addr, uns
     return pageCount;
 }
 
+#if RGA2_DEBUGFS
+static int rga2_UserMemory_cheeck(struct page **pages, u32 w, u32 h, u32 format, int flag)
+{
+	int bits;
+	void *vaddr = NULL;
+	int taipage_num;
+	int taidata_num;
+	int *tai_vaddr = NULL;
+
+	switch (format) {
+	case RGA2_FORMAT_RGBA_8888:
+	case RGA2_FORMAT_RGBX_8888:
+	case RGA2_FORMAT_BGRA_8888:
+	case RGA2_FORMAT_BGRX_8888:
+		bits = 32;
+		break;
+	case RGA2_FORMAT_RGB_888:
+	case RGA2_FORMAT_BGR_888:
+		bits = 24;
+		break;
+	case RGA2_FORMAT_RGB_565:
+	case RGA2_FORMAT_RGBA_5551:
+	case RGA2_FORMAT_RGBA_4444:
+	case RGA2_FORMAT_BGR_565:
+	case RGA2_FORMAT_YCbCr_422_SP:
+	case RGA2_FORMAT_YCbCr_422_P:
+	case RGA2_FORMAT_YCrCb_422_SP:
+	case RGA2_FORMAT_YCrCb_422_P:
+	case RGA2_FORMAT_BGRA_5551:
+	case RGA2_FORMAT_BGRA_4444:
+		bits = 16;
+		break;
+	case RGA2_FORMAT_YCbCr_420_SP:
+	case RGA2_FORMAT_YCbCr_420_P:
+	case RGA2_FORMAT_YCrCb_420_SP:
+	case RGA2_FORMAT_YCrCb_420_P:
+		bits = 12;
+		break;
+	case RGA2_FORMAT_YCbCr_420_SP_10B:
+	case RGA2_FORMAT_YCrCb_420_SP_10B:
+	case RGA2_FORMAT_YCbCr_422_SP_10B:
+	case RGA2_FORMAT_YCrCb_422_SP_10B:
+		bits = 15;
+		break;
+	default:
+		printk("un know format\n");
+		return -1;
+	}
+	taipage_num = w * h * bits / 8 / (1024 * 4);
+	taidata_num = w * h * bits / 8 % (1024 * 4);
+	if (taidata_num == 0) {
+		vaddr = kmap(pages[taipage_num - 1]);
+		tai_vaddr = (int *)vaddr + 1023;
+	} else {
+		vaddr = kmap(pages[taipage_num]);
+		tai_vaddr = (int *)vaddr + taidata_num / 4 - 1;
+	}
+	if (flag == 1) {
+		printk(KERN_DEBUG "src user memory check\n");
+		printk(KERN_DEBUG "tai data is %d\n", *tai_vaddr);
+	} else {
+		printk(KERN_DEBUG "dst user memory check\n");
+		printk(KERN_DEBUG "tai data is %d\n", *tai_vaddr);
+	}
+	if (taidata_num == 0)
+		kunmap(pages[taipage_num - 1]);
+	else
+		kunmap(pages[taipage_num]);
+	return 0;
+}
+#endif
+
 static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 			      unsigned long Memory, uint32_t pageCount,
 			      int writeFlag)
@@ -269,7 +374,7 @@ static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 	uint32_t status;
 	unsigned long Address;
 	unsigned long pfn;
-	void *virt;
+	struct page __maybe_unused *page;
 	spinlock_t * ptl;
 	pte_t * pte;
 	pgd_t * pgd;
@@ -292,8 +397,10 @@ static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 		for (i = 0; i < pageCount; i++) {
 			/* Get the physical address from page struct. */
 			pageTable[i] = page_to_phys(pages[i]);
-			virt = phys_to_virt(pageTable[i]);
-			rga_dma_flush_range(virt, virt + 4 * 1024);
+			/* ensure dst not flush null cache */
+			if (writeFlag && i >= pageCount - 2)
+				break;
+			rga_dma_flush_page(pages[i]);
 		}
 		for (i = 0; i < result; i++)
 			put_page(pages[i]);
@@ -311,17 +418,20 @@ static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 			break;
 		}
 		pgd = pgd_offset(current->mm, (Memory + i) << PAGE_SHIFT);
-		if (pgd_val(*pgd) == 0) {
+		if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd))) {
+			pr_err("RGA2 failed to get pgd\n");
 			status = RGA2_OUT_OF_RESOURCES;
 			break;
 		}
 		pud = pud_offset(pgd, (Memory + i) << PAGE_SHIFT);
-		if (!pud) {
+		if (pud_none(*pud) || unlikely(pud_bad(*pud))) {
+			pr_err("RGA2 failed to get pud\n");
 			status = RGA2_OUT_OF_RESOURCES;
 			break;
 		}
 		pmd = pmd_offset(pud, (Memory + i) << PAGE_SHIFT);
-		if (!pmd) {
+		if (pmd_none(*pmd) || unlikely(pmd_bad(*pmd))) {
+			pr_err("RGA2 failed to get pmd\n");
 			status = RGA2_OUT_OF_RESOURCES;
 			break;
 		}
@@ -329,6 +439,7 @@ static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 					  (Memory + i) << PAGE_SHIFT,
 					  &ptl);
 		if (!pte) {
+			pr_err("RGA2 failed to get pte\n");
 			pte_unmap_unlock(pte, ptl);
 			status = RGA2_OUT_OF_RESOURCES;
 			break;
@@ -338,8 +449,9 @@ static int rga2_MapUserMemory(struct page **pages, uint32_t *pageTable,
 			   << PAGE_SHIFT)) & ~PAGE_MASK));
 		pte_unmap_unlock(pte, ptl);
 		pageTable[i] = (uint32_t)Address;
-		virt = phys_to_virt(pageTable[i]);
-		rga_dma_flush_range(virt, virt + 4 * 1024);
+		if ( writeFlag && (i >= pageCount - 2))
+			break;
+		rga_dma_flush_page(pfn_to_page(pfn));
 	}
 	up_read(&current->mm->mmap_sem);
 	return status;
@@ -400,6 +512,9 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
 	Src0PageCount = 0;
 	Src1PageCount = 0;
 	DstPageCount = 0;
+	Src0Start = 0;
+	Src1Start = 0;
+	DstStart = 0;
 
 	/* cal src0 buf mmu info */
 	if (req->mmu_info.src0_mmu_flag & 1) {
@@ -435,6 +550,8 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
 						 req->dst.vir_w,
 						 req->dst.vir_h,
 						 &DstStart);
+		/* if vir_address not 4k align need more page */
+		DstPageCount += 2;
 		if (DstPageCount == 0)
 			return -EINVAL;
 	}
@@ -457,12 +574,19 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
 				(rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
         mutex_unlock(&rga2_service.lock);
         if (Src0MemSize) {
-		if (req->sg_src0)
+		if (req->sg_src0) {
 			ret = rga2_MapION(req->sg_src0,
 					  &MMU_Base[0], Src0MemSize);
-		else
+		} else {
 			ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0],
 						 Src0Start, Src0PageCount, 0);
+#if RGA2_DEBUGFS
+		if (RGA2_CHECK_MODE)
+			rga2_UserMemory_cheeck(&pages[0], req->src.vir_w,
+					       req->src.vir_h, req->src.format,
+					       1);
+#endif
+		}
 
 		if (ret < 0) {
 			pr_err("rga2 map src0 memory failed\n");
@@ -501,13 +625,20 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
 		req->src1.yrgb_addr = (req->src.yrgb_addr & (~PAGE_MASK));
 	}
         if (DstMemSize) {
-		if (req->sg_dst)
+		if (req->sg_dst) {
 			ret = rga2_MapION(req->sg_dst, MMU_Base + Src0MemSize
 					  + Src1MemSize, DstMemSize);
-		else
+		} else {
 			ret = rga2_MapUserMemory(&pages[0], MMU_Base
 						 + Src0MemSize + Src1MemSize,
 						 DstStart, DstPageCount, 1);
+#if RGA2_DEBUGFS
+		if (RGA2_CHECK_MODE)
+			rga2_UserMemory_cheeck(&pages[0], req->src.vir_w,
+					       req->src.vir_h, req->src.format,
+					       2);
+#endif
+		}
 		if (ret < 0) {
 			pr_err("rga2 map dst memory failed\n");
 			status = ret;
@@ -702,6 +833,7 @@ static int rga2_mmu_info_color_fill_mode(struct rga2_reg *reg, struct rga2_req *
         /* flush data to DDR */
         rga_dma_flush_range(MMU_Base, (MMU_Base + AllSize + 1));
         rga2_mmu_buf_get(&rga2_mmu_buf, AllSize);
+	reg->MMU_len = AllSize;
 
         return 0;
     }

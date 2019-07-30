@@ -54,6 +54,17 @@ static void xhci_plat_quirks(struct device *dev, struct xhci_hcd *xhci)
 	 */
 	if (pdata && pdata->xhci_slow_suspend)
 		xhci->quirks |= XHCI_SLOW_SUSPEND;
+
+	if (pdata && pdata->usb3_warm_reset_on_resume)
+		xhci->quirks |= XHCI_WARM_RESET_ON_RESUME;
+
+	/*
+	 * On some xHCI controllers (e.g. Rockchip RK3399/RK3328/RK1808),
+	 * they need to enable the ENT flag in the TRB data structure to
+	 * force xHC to pre-fetch the next TRB of a TD.
+	 */
+	if (pdata && pdata->xhci_trb_ent)
+		xhci->quirks |= XHCI_TRB_ENT_QUIRK;
 }
 
 /* called during probe() after chip reset completes */
@@ -102,7 +113,7 @@ static int xhci_plat_probe(struct platform_device *pdev)
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
-		return -ENODEV;
+		return irq;
 
 	/* Try to set 64-bit DMA first */
 	if (WARN_ON(!pdev->dev.dma_mask))
@@ -207,9 +218,6 @@ static int xhci_plat_probe(struct platform_device *pdev)
 	if (ret)
 		goto dealloc_usb2_hcd;
 
-	if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
-		xhci->shared_hcd->can_do_streams = 1;
-
 	return 0;
 
 
@@ -309,7 +317,6 @@ MODULE_DEVICE_TABLE(acpi, usb_xhci_acpi_match);
 static struct platform_driver usb_xhci_driver = {
 	.probe	= xhci_plat_probe,
 	.remove	= xhci_plat_remove,
-	.shutdown = usb_hcd_platform_shutdown,
 	.driver	= {
 		.name = "xhci-hcd",
 		.pm = DEV_PM_OPS,

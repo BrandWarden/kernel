@@ -24,7 +24,29 @@
 #include <linux/platform_data/rk_isp10_platform.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-controls_rockchip.h>
+#include <media/videobuf2-v4l2.h>
+
+#include <linux/dma-iommu.h>
+#include <drm/rockchip_drm.h>
+#include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
+
 /*****************************************************************************/
+
+#if IS_ENABLED(CONFIG_VIDEOBUF2_DMA_CONTIG)
+#define CIF_ISP10_MODE_DMA_CONTIG 1
+#endif
+
+#if IS_ENABLED(CONFIG_VIDEOBUF2_DMA_SG)
+#define CIF_ISP10_MODE_DMA_SG 1
+#endif
+
+#if !defined(CIF_ISP10_MODE_DMA_CONTIG) && \
+	!defined(CIF_ISP10_MODE_DMA_SG)
+#error One of the videobuf buffer modes(COTING/SG) \
+	must be selected in the config
+#endif
+
 /* Definitions */
 
 #define CONFIG_CIF_ISP_AUTO_UPD_CFG_BUG
@@ -74,6 +96,12 @@ enum cif_isp10_pm_state {
 	CIF_ISP10_PM_STATE_SUSPENDED,
 	CIF_ISP10_PM_STATE_SW_STNDBY,
 	CIF_ISP10_PM_STATE_STREAMING
+};
+
+enum cif_isp10_ispstate {
+	CIF_ISP10_STATE_IDLE      = 0,
+	CIF_ISP10_STATE_RUNNING   = 1,
+	CIF_ISP10_STATE_STOPPING  = 2
 };
 
 enum cif_isp10_inp {
@@ -133,6 +161,8 @@ enum cif_isp10_cid {
 	CIF_ISP10_CID_AUTO_FPS                    = 16,
 	CIF_ISP10_CID_VBLANKING                   = 17,
 	CIF_ISP10_CID_ISO_SENSITIVITY             = 18,
+	CIF_ISP10_CID_MIN_BUFFER_FOR_CAPTURE      = 19,
+	CIF_ISP10_CID_TEST_PATTERN                = 20,
 
 };
 
@@ -213,10 +243,20 @@ enum cif_isp10_image_effect {
 	(!CIF_ISP10_PIX_FMT_IS_YUV(pix_fmt) ||\
 	!CIF_ISP10_PIX_FMT_YUV_GET_NUM_CPLANES(pix_fmt))
 
+#define CIF_ISP10_PIX_FMT_IS_Y_ONLY(pix_fmt) \
+	((CIF_ISP10_PIX_FMT_IS_YUV(pix_fmt) == 1) && \
+	(CIF_ISP10_PIX_FMT_YUV_GET_X_SUBS(pix_fmt) == 0) && \
+	(CIF_ISP10_PIX_FMT_YUV_GET_Y_SUBS(pix_fmt) == 0) && \
+	(CIF_ISP10_PIX_FMT_YUV_IS_YC_SWAPPED(pix_fmt) == 0))
+
+#define CIF_ISP10_IMG_SRC_DATA_NUM	6
+
 enum cif_isp10_pix_fmt {
 	/* YUV */
 	CIF_YUV400			= 0x10008000,
 	CIF_YVU400			= 0x10008004,
+	CIF_Y10				= 0x1000a000,
+	CIF_Y12				= 0x10010000,
 
 	CIF_YUV420I			= 0x1000c220,
 	CIF_YUV420SP			= 0x1000c221,	/* NV12 */
@@ -265,7 +305,7 @@ enum cif_isp10_pix_fmt {
 	/* RGB */
 	CIF_RGB565			= 0x20010000,
 	CIF_RGB666			= 0x20012000,
-	CIF_RGB888			= 0x20018000,
+	CIF_RGB888			= 0x20020000,
 
 	/* RAW Bayer */
 	CIF_BAYER_SBGGR8		= 0x30008000,
@@ -408,7 +448,13 @@ struct cif_isp10_mi_path_config {
 	u32 y_size;
 	u32 cb_size;
 	u32 cr_size;
+	u32 burst_len;
 	bool busy;
+
+	/* FOR BT655: 0 = ODD, 1 = EVEN */
+	bool field_flag;
+	/* for interlace offset */
+	u32 vir_len_offset;
 };
 
 struct cif_isp10_zoom_buffer_info {
@@ -426,19 +472,16 @@ struct cif_isp10_mi_config {
 	struct cif_isp10_mi_path_config dma;
 };
 
-#ifdef NO_YET
 struct cif_isp10_buffer {
-	struct list_head list;
-	u32 dma_addr;
-	u32 size;
+	struct vb2_v4l2_buffer vb;
+	struct list_head queue;
+	unsigned long int size;
 };
-#else
-#define cif_isp10_buffer videobuf_buffer
-#endif
 
 struct cif_isp10_metadata_s {
 	unsigned int cnt;
 	unsigned int vmas;
+	spinlock_t spinlock;
 	unsigned char *d;
 };
 
@@ -447,8 +490,8 @@ struct cif_isp10_stream {
 	enum cif_isp10_state state;
 	enum cif_isp10_state saved_state;
 	struct list_head buf_queue;
-	struct videobuf_buffer *curr_buf;
-	struct videobuf_buffer *next_buf;
+	struct cif_isp10_buffer *curr_buf;
+	struct cif_isp10_buffer *next_buf;
 	bool updt_cfg;
 	bool stall;
 	bool stop;
@@ -522,7 +565,7 @@ struct cif_isp10_mi_state {
 
 struct cif_isp10_img_src_exp {
 	struct list_head list;
-	struct cif_isp10_img_src_ext_ctrl *exp;
+	struct cif_isp10_img_src_ext_ctrl exp;
 };
 
 struct cif_isp10_img_src_data {
@@ -535,12 +578,15 @@ struct cif_isp10_img_src_exps {
 	struct list_head list;
 
 	struct mutex mutex;	/* protect frm_exp */
-	struct cif_isp10_img_src_data data[2];
-	unsigned char exp_valid_frms;
+	struct cif_isp10_img_src_data data[CIF_ISP10_IMG_SRC_DATA_NUM];
+	unsigned char exp_idx;
+	unsigned char exp_valid_frms[2];
+	bool inited;
 };
 
 enum cif_isp10_isp_vs_cmd {
-	CIF_ISP10_VS_EXP = 0,
+	CIF_ISP10_VS_EXIT = 0,
+	CIF_ISP10_VS_EXP = 1
 };
 
 struct cif_isp10_isp_vs_work {
@@ -559,19 +605,49 @@ struct cif_isp10_fmt {
 	unsigned char overlay;
 };
 
+#ifdef CIF_ISP10_MODE_DMA_SG
+struct cif_isp10_iommu {
+	int client_fd;
+	int map_fd;
+	unsigned long linear_addr;
+	unsigned long len;
+};
+
+struct cif_isp10_dma_buf {
+	struct dma_buf *dma_buffer;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	dma_addr_t dma_addr;
+	int fd;
+};
+#endif
+
 struct cif_isp10_device {
 	unsigned int dev_id;
 	CIF_ISP10_PLTFRM_DEVICE dev;
 	struct v4l2_device v4l2_dev;
 	enum cif_isp10_pm_state pm_state;
 	enum cif_isp10_img_src_state img_src_state;
+	enum cif_isp10_ispstate isp_state;
 
 	spinlock_t vbq_lock;	/* spinlock for videobuf queues */
 	spinlock_t vbreq_lock;	/* spinlock for videobuf requeues */
+	spinlock_t iowrite32_verify_lock;
+	spinlock_t isp_state_lock;
+
+	wait_queue_head_t isp_stop_wait;	/* wait while isp stop */
+	unsigned int isp_stop_flags;
 
 	struct cif_isp10_img_src *img_src;
 	struct cif_isp10_img_src *img_src_array[CIF_ISP10_NUM_INPUTS];
 	unsigned int img_src_cnt;
+	struct vb2_alloc_ctx *alloc_ctx;
+
+#ifdef CIF_ISP10_MODE_DMA_SG
+	struct iommu_domain *domain;
+	struct cif_isp10_dma_buf dma_buffer[VB2_MAX_FRAME];
+	int dma_buf_cnt;
+#endif
 	struct cif_isp10_img_src_exps img_src_exps;
 
 	struct cif_isp10_config config;
@@ -595,8 +671,10 @@ struct cif_isp10_device {
 	int   otf_zsl_mode;
 	struct flash_timeinfo_s flash_t;
 
-	struct pltfrm_soc_cfg *soc_cfg;
+	struct pltfrm_soc_cfg soc_cfg;
 	void *nodes;
+
+	struct mutex api_mutex; /* user api mutex */
 
 };
 
@@ -607,6 +685,29 @@ struct v4l2_fmtdesc *get_cif_isp10_output_format_desc(int index);
 int get_cif_isp10_output_format_desc_size(void);
 
 /* Clean code starts from here */
+
+static inline
+struct cif_isp10_stream *to_stream_by_id(struct cif_isp10_device *dev,
+					 enum cif_isp10_stream_id id)
+{
+	if (WARN_ON(id != CIF_ISP10_STREAM_MP &&
+		id != CIF_ISP10_STREAM_SP &&
+		id != CIF_ISP10_STREAM_DMA &&
+		id != CIF_ISP10_STREAM_ISP))
+		return &dev->sp_stream;
+
+	switch (id) {
+	case CIF_ISP10_STREAM_MP:
+		return &dev->mp_stream;
+	case CIF_ISP10_STREAM_SP:
+		return &dev->sp_stream;
+	case CIF_ISP10_STREAM_DMA:
+		return &dev->dma_stream;
+	case CIF_ISP10_STREAM_ISP:
+		return NULL;
+	}
+	return NULL;
+}
 
 struct cif_isp10_device *cif_isp10_create(
 	CIF_ISP10_PLTFRM_DEVICE pdev,
@@ -633,6 +734,10 @@ int cif_isp10_streamon(
 int cif_isp10_streamoff(
 	struct cif_isp10_device *dev,
 	u32 stream_ids);
+
+int cif_isp10_g_input(
+	struct cif_isp10_device *dev,
+	enum cif_isp10_inp *inp);
 
 int cif_isp10_s_input(
 	struct cif_isp10_device *dev,
@@ -683,28 +788,27 @@ const char *cif_isp10_g_input_name(
 int cif_isp10_calc_min_out_buff_size(
 	struct cif_isp10_device *dev,
 	enum cif_isp10_stream_id stream_id,
-	u32 *size);
+	u32 *size,
+	bool payload);
 
 int cif_isp10_s_ctrl(
 	struct cif_isp10_device *dev,
 	const enum cif_isp10_cid id,
 	int val);
 
-void cif_isp10_dbgfs_fill_sensor_aec_para(
-	struct cif_isp10_device *cif_isp10_dev,
-	s32 exp_time,
-	u16 gain);
-
-int cif_isp10_s_isp_metadata(
+int cif_isp10_s_vb_metadata(
 	struct cif_isp10_device *dev,
-	struct cif_isp10_isp_readout_work *readout_work,
-	struct cifisp_isp_other_cfg *new_other,
-	struct cifisp_isp_meas_cfg *new_meas,
-	struct cifisp_stat_buffer *new_stats);
+	struct cif_isp10_isp_readout_work *readout_work);
 
 int cif_isp10_s_exp(
 	struct cif_isp10_device *dev,
-	struct cif_isp10_img_src_ext_ctrl *exp_ctrl);
+	struct cif_isp10_img_src_ext_ctrl *exp_ctrl,
+	bool cls_exp);
+
+int cif_isp10_s_vcm(
+	struct cif_isp10_device *dev,
+	unsigned int id,
+	int val);
 
 void cif_isp10_sensor_mode_data_sync(
 	struct cif_isp10_device *dev,

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __RKCAMSYS_SOC_RK3288_H__
 #define __RKCAMSYS_SOC_RK3288_H__
 
@@ -33,6 +34,7 @@
 #define DPHY_TX1RX1_ENABLECLK           (0x1 << 12)
 #define DPHY_TX1RX1_DISABLECLK          (0x0 << 12)
 #define DPHY_RX1_SRC_SEL_ISP          (0x1 << 13)
+#define DPHY_RX1_SRC_SEL_CSI          (0x0 << 13)
 #define DPHY_TX1RX1_SLAVEZ            (0x0 << 14)
 #define DPHY_TX1RX1_BASEDIR_REC       (0x1 << 15)
 
@@ -72,6 +74,8 @@
 #define DPHY_TX1RX1_TURN_DISABLE_OFFSET_BITS   (0x0)
 #define DPHY_TX1RX1_ENABLE_MASK                (0xf << 28)
 #define DPHY_TX1RX1_ENABLE_OFFSET_BITS         (12)
+#define DPHY_TX1RX1_FORCE_RX_MODE_MASK         (0xf << 20)
+#define DPHY_TX1RX1_FORCE_RX_MODE_OFFSET_BITS  (0x0)
 
 /*
 *GRF_SOC_CON15
@@ -99,9 +103,9 @@
 #define CSIHOST_ERR2                      (0x24)
 
 #define write_grf_reg(addr, val)           \
-	__raw_writel(val, addr + RK_GRF_VIRT)
+	__raw_writel(val, (void *)(addr + para->camsys_dev->rk_grf_base))
 #define read_grf_reg(addr)                 \
-	__raw_readl(addr + RK_GRF_VIRT)
+	__raw_readl((void *)(addr + para->camsys_dev->rk_grf_base))
 #define mask_grf_reg(addr, msk, val)       \
 	write_grf_reg(addr, (val) | ((~(msk)) & read_grf_reg(addr)))
 #ifdef CONFIG_ARM64

@@ -29,6 +29,10 @@
 #define RK805_OUT0_VALMASK	BIT(0)
 #define RK805_OUT1_VALMASK	BIT(1)
 
+#define RK816_FUN_MASK		BIT(2)
+#define RK816_OUT_VALMASK	BIT(3)
+#define RK816_DIR_MASK		BIT(4)
+
 struct rk8xx_gpio_reg {
 	u8 reg;
 	u8 dir_msk;
@@ -46,7 +50,7 @@ struct rk8xx_gpio_info {
 static int rk8xx_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 {
 	int err;
-	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->dev);
+	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->parent);
 
 	/* iomux */
 	if (gi->gpio_reg[offset].fun_msk) {
@@ -55,7 +59,7 @@ static int rk8xx_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 					 gi->gpio_reg[offset].fun_msk,
 					 gi->gpio_reg[offset].fun_msk);
 		if (err) {
-			dev_err(chip->dev, "set gpio%d func fail: %d\n",
+			dev_err(chip->parent, "set gpio%d func fail: %d\n",
 				offset, err);
 			return err;
 		}
@@ -68,7 +72,7 @@ static int rk8xx_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 					 gi->gpio_reg[offset].dir_msk,
 					 0);
 		if (err) {
-			dev_err(chip->dev, "set gpio%d input fail: %d\n",
+			dev_err(chip->parent, "set gpio%d input fail: %d\n",
 				offset, err);
 			return err;
 		}
@@ -81,7 +85,7 @@ static int rk8xx_gpio_direction_output(struct gpio_chip *chip,
 				       unsigned offset, int value)
 {
 	int err;
-	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->dev);
+	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->parent);
 
 	/* iomux */
 	if (gi->gpio_reg[offset].fun_msk) {
@@ -90,7 +94,7 @@ static int rk8xx_gpio_direction_output(struct gpio_chip *chip,
 					 gi->gpio_reg[offset].fun_msk,
 					 gi->gpio_reg[offset].fun_msk);
 		if (err) {
-			dev_err(chip->dev, "set gpio%d func fail: %d\n",
+			dev_err(chip->parent, "set gpio%d func fail: %d\n",
 				offset, err);
 			return err;
 		}
@@ -103,7 +107,7 @@ static int rk8xx_gpio_direction_output(struct gpio_chip *chip,
 					 gi->gpio_reg[offset].dir_msk,
 					 gi->gpio_reg[offset].dir_msk);
 		if (err) {
-			dev_err(chip->dev,
+			dev_err(chip->parent,
 				"set gpio%d output fail: %d\n", offset, err);
 			return err;
 		}
@@ -120,7 +124,7 @@ static int rk8xx_gpio_direction_output(struct gpio_chip *chip,
 					 gi->gpio_reg[offset].val_msk,
 					 0);
 	if (err) {
-		dev_err(chip->dev, "set gpio%d value fail: %d\n", offset, err);
+		dev_err(chip->parent, "set gpio%d value fail: %d\n", offset, err);
 		return err;
 	}
 
@@ -131,11 +135,11 @@ static int rk8xx_gpio_get_value(struct gpio_chip *chip, unsigned offset)
 {
 	int err;
 	unsigned int val;
-	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->dev);
+	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->parent);
 
 	err = regmap_read(gi->rk8xx->regmap, gi->gpio_reg[offset].reg, &val);
 	if (err) {
-		dev_err(chip->dev, "get gpio%d value fail: %d\n", offset, err);
+		dev_err(chip->parent, "get gpio%d value fail: %d\n", offset, err);
 		return err;
 	}
 
@@ -146,7 +150,7 @@ static void rk8xx_gpio_set_value(struct gpio_chip *chip,
 				 unsigned offset, int value)
 {
 	int err;
-	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->dev);
+	struct rk8xx_gpio_info *gi = dev_get_drvdata(chip->parent);
 
 	if (value)
 		err = regmap_update_bits(gi->rk8xx->regmap,
@@ -159,7 +163,7 @@ static void rk8xx_gpio_set_value(struct gpio_chip *chip,
 					 gi->gpio_reg[offset].val_msk,
 					 0);
 	if (err)
-		dev_err(chip->dev, "set gpio%d value fail: %d\n", offset, err);
+		dev_err(chip->parent, "set gpio%d value fail: %d\n", offset, err);
 }
 
 /* rk805: two gpio: output only */
@@ -171,6 +175,15 @@ static struct rk8xx_gpio_reg rk805_gpio_reg[] = {
 	{
 		.reg = RK805_GPIO_REG,
 		.val_msk = RK805_OUT1_VALMASK,
+	},
+};
+
+static struct rk8xx_gpio_reg rk816_gpio_reg[] = {
+	{
+		.reg = RK816_GPIO_IO_POL_REG,
+		.dir_msk = RK816_DIR_MASK,
+		.val_msk = RK816_OUT_VALMASK,
+		.fun_msk = RK816_FUN_MASK,
 	},
 };
 
@@ -198,6 +211,10 @@ static int rk8xx_gpio_probe(struct platform_device *pdev)
 		gi->gpio_reg = rk805_gpio_reg;
 		gi->gpio_nr = ARRAY_SIZE(rk805_gpio_reg);
 		break;
+	case RK816_ID:
+		gi->gpio_reg = rk816_gpio_reg;
+		gi->gpio_nr = ARRAY_SIZE(rk816_gpio_reg);
+		break;
 	default:
 		dev_err(&pdev->dev, "unsupported RK8XX ID %lu\n",
 			rk8xx->variant);
@@ -207,7 +224,7 @@ static int rk8xx_gpio_probe(struct platform_device *pdev)
 	gi->rk8xx = rk8xx;
 	gi->gpio_chip.base = -1;
 	gi->gpio_chip.can_sleep = true;
-	gi->gpio_chip.dev = &pdev->dev;
+	gi->gpio_chip.parent = &pdev->dev;
 	gi->gpio_chip.ngpio = gi->gpio_nr;
 	gi->gpio_chip.label = pdev->name;
 	gi->gpio_chip.get = rk8xx_gpio_get_value;
@@ -221,8 +238,13 @@ static int rk8xx_gpio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, gi);
 
 	ret = gpiochip_add(&gi->gpio_chip);
-	if (ret)
+	if (ret) {
 		dev_err(&pdev->dev, "register rk8xx gpiochip fail: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&pdev->dev, "register rk%lx gpio successful\n",
+		 rk8xx->variant);
 
 	return ret;
 }

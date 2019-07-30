@@ -41,68 +41,39 @@
  */
 
 /dts-v1/;
-
-#include "rk3399-excavator-sapphire.dtsi"
-#include "rk3399-android.dtsi"
-#include "rk3399-vop-clk-set.dtsi"
+#include "rk3399-sapphire-excavator-edp.dtsi"
 
 / {
 	model = "Rockchip RK3399 Excavator Board edp (Android)";
 	compatible = "rockchip,android", "rockchip,rk3399-excavator-edp", "rockchip,rk3399";
+};
 
-	edp_panel: edp-panel {
-		compatible = "lg,lp079qx1-sp0v", "panel-simple";
-		backlight = <&backlight>;
-		power-supply = <&vcc3v3_s0>;
-		enable-gpios = <&gpio4 30 GPIO_ACTIVE_HIGH>;
-
-		ports {
-			panel_in_edp: endpoint {
-				remote-endpoint = <&edp_out_panel>;
-			};
+&firmware_android {
+	compatible = "android,firmware";
+	fstab {
+		compatible = "android,fstab";
+		system {
+			compatible = "android,system";
+			dev = "/dev/block/by-name/system";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
 		};
-	};
-
-	test-power {
-		status = "okay";
-	};
-
-	rt5651 {
-		status = "okay";
-	};
-};
-
-&backlight {
-	status = "okay";
-	enable-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
-};
-
-&edp {
-	status = "okay";
-
-	ports {
-		edp_out: port@1 {
-			reg = <1>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			edp_out_panel: endpoint@0 {
-				reg = <0>;
-				remote-endpoint = <&panel_in_edp>;
-			};
+		vendor {
+			compatible = "android,vendor";
+			dev = "/dev/block/by-name/vendor";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
 		};
 	};
 };
 
-&edp_in_vopl {
+&dp_sound {
 	status = "disabled";
 };
 
-&hdmi {
-	status = "okay";
-};
-
-&hdmi_in_vopb {
+&hdmi_dp_sound {
 	status = "disabled";
 };
 
@@ -110,42 +81,10 @@
 	status = "okay";
 };
 
-&i2s2 {
+&isp0 {
 	status = "okay";
 };
 
-&i2c1 {
-	status = "okay";
-
-	gsl3673: gsl3673@40 {
-		compatible = "GSL,GSL3673";
-		reg = <0x40>;
-		screen_max_x = <1536>;
-		screen_max_y = <2048>;
-		irq_gpio_number = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
-		rst_gpio_number = <&gpio4 22 GPIO_ACTIVE_HIGH>;
-	};
-};
-
-&vopb {
-	assigned-clocks = <&cru DCLK_VOP0_DIV>;
-	assigned-clock-parents = <&cru PLL_CPLL>;
-};
-
-&vopl {
-	assigned-clocks = <&cru DCLK_VOP1_DIV>;
-	assigned-clock-parents = <&cru PLL_VPLL>;
-};
-
-&route_edp {
+&isp1 {
 	status = "okay";
 };
-
-&pinctrl {
-	lcd-panel {
-		lcd_panel_reset: lcd-panel-reset {
-			rockchip,pins = <4 30 RK_FUNC_GPIO &pcfg_pull_up>;
-		};
-	};
-};
-
